@@ -8,10 +8,10 @@ common:
 
 datasets:
   data_root: '/scratch/eigenscape'
-  batch_size: 8  # Reduced batch size for single GPU
+  batch_size: 16  # Increased batch size for better GPU utilization
   tensor_cut: 24000  # 1 second at 24kHz
   num_workers: 4
-  fixed_length: 0
+  fixed_length: 27600  # Use all 27,600 seconds of audio data per epoch
   pin_memory: True
 
 checkpoint:

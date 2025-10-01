@@ -25,6 +25,7 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
         self.tensor_cut = config.datasets.tensor_cut
         self.fixed_length = config.datasets.fixed_length
         self.transform = transform
+        self.mode = mode
         
         # Define folder splits
         if mode == 'train':
@@ -47,42 +48,84 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
         if len(self.audio_files) == 0:
             raise ValueError(f"No audio files found in folders: {self.folders}")
         
+        # For validation, create fixed segments
+        if mode == 'test':
+            self.fixed_segments = self._create_fixed_validation_segments()
+        
         logger.info(f"Found {len(self.audio_files)} audio files for {mode} mode")
         logger.info(f"Folders: {self.folders}")
 
     def __len__(self):
-        return self.fixed_length if self.fixed_length and len(self.audio_files) > self.fixed_length else len(self.audio_files)
+        return self.fixed_length if self.fixed_length > 0 else len(self.audio_files)
 
-    def get(self, idx=None):
-        """Get uncropped, untransformed audio with random channel selection."""
-        if idx is not None and idx >= len(self.audio_files):
-            raise StopIteration
-        if idx is None:
-            idx = random.randrange(len(self.audio_files))
+    def _create_fixed_validation_segments(self):
+        """Create fixed validation segments for consistent evaluation."""
+        fixed_segments = []
+        random.seed(42)  # Fixed seed for reproducible validation
         
-        try:
-            audio_path = self.audio_files[idx]
-            logger.debug(f'Loading {audio_path}')
+        for i in range(min(100, len(self.audio_files))):  # Use up to 100 validation segments
+            audio_path = self.audio_files[i % len(self.audio_files)]
             
-            # First, get file info to determine number of channels
+            # Get file info
             info = sf.info(audio_path)
             num_channels = info.channels
             file_duration = info.frames / info.samplerate
             
-            # Randomly select one channel (1-32, 0-indexed as 0-31)
-            # If file has fewer channels, cycle through them
-            channel_idx = random.randint(0, min(31, num_channels - 1))
+            # Fixed channel and time selection
+            channel_idx = i % min(32, num_channels)
+            max_start_time = max(0, file_duration - 1.0)
+            start_time = (i * 0.1) % max_start_time  # Fixed pattern
             
-            # Randomly select start time for 1-second segment
-            max_start_time = max(0, file_duration - 1.0)  # Leave 1 second at end
-            start_time = random.uniform(0, max_start_time)
+            fixed_segments.append({
+                'audio_path': audio_path,
+                'channel_idx': channel_idx,
+                'start_time': start_time,
+                'sample_rate': info.samplerate
+            })
+        
+        random.seed()  # Reset to random seed
+        return fixed_segments
+
+    def get(self, idx=None):
+        """Get uncropped, untransformed audio with random channel selection."""
+        if idx is not None and idx >= len(self):
+            raise StopIteration
+        if idx is None:
+            idx = random.randrange(len(self))
+        
+        try:
+            # For validation, use fixed segments
+            if self.mode == 'test' and hasattr(self, 'fixed_segments'):
+                segment = self.fixed_segments[idx % len(self.fixed_segments)]
+                audio_path = segment['audio_path']
+                channel_idx = segment['channel_idx']
+                start_time = segment['start_time']
+                sample_rate = segment['sample_rate']
+            else:
+                # For training, use random selection
+                audio_path = self.audio_files[idx % len(self.audio_files)]
+                logger.debug(f'Loading {audio_path}')
+                
+                # First, get file info to determine number of channels
+                info = sf.info(audio_path)
+                num_channels = info.channels
+                file_duration = info.frames / info.samplerate
+                
+                # Randomly select one channel (1-32, 0-indexed as 0-31)
+                # If file has fewer channels, cycle through them
+                channel_idx = random.randint(0, min(31, num_channels - 1))
+                
+                # Randomly select start time for 1-second segment
+                max_start_time = max(0, file_duration - 1.0)  # Leave 1 second at end
+                start_time = random.uniform(0, max_start_time)
+                sample_rate = info.samplerate
             
             # Load only the specific channel and segment
             # soundfile.read can load specific channels and time ranges
             audio_data, sample_rate = sf.read(
                 audio_path, 
-                start=int(start_time * info.samplerate),
-                frames=int(1.0 * info.samplerate),  # 1 second
+                start=int(start_time * sample_rate),
+                frames=int(1.0 * sample_rate),  # 1 second
                 always_2d=False  # Get 1D array for single channel
             )
             
@@ -114,9 +157,9 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
             return mono_audio, self.sample_rate
             
         except Exception as e:
-            logger.warning(f"Error loading {self.audio_files[idx]}: {e}")
+            logger.warning(f"Error loading audio: {e}")
             # Return a random sample instead
-            return self[random.randint(0, len(self.audio_files) - 1)]
+            return self[random.randint(0, len(self) - 1)]
 
     def __getitem__(self, idx):
         waveform, sample_rate = self.get(idx)
