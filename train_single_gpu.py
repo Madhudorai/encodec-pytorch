@@ -100,7 +100,7 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         optimizer_disc.zero_grad()
         train_discriminator = torch.BoolTensor([config.model.train_discriminator 
                                and epoch >= config.lr_scheduler.warmup_epoch 
-                               and random.random() < float(eval(config.model.train_discriminator))]).cuda()
+                               and random.random() < 0.5]).cuda()
 
         if train_discriminator:
             with autocast(enabled=config.common.amp):
@@ -367,8 +367,10 @@ def train(config):
             
             # Log model artifacts to wandb
             if wandb_logger:
-                wandb_logger.log_artifact(wandb.Artifact(f'model_epoch_{epoch}', type='model'), 
-                                        paths=[model_path, disc_path])
+                artifact = wandb.Artifact(f'model_epoch_{epoch}', type='model')
+                artifact.add_file(model_path)
+                artifact.add_file(disc_path)
+                wandb_logger.log_artifact(artifact)
     
     # Finish wandb run
     if wandb_logger:
@@ -378,6 +380,10 @@ def train(config):
 def main(config):
     # disable cudnn
     torch.backends.cudnn.enabled = False
+    
+    # Memory optimization
+    torch.cuda.empty_cache()
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
     if not os.path.exists(config.checkpoint.save_folder):
         os.makedirs(config.checkpoint.save_folder)

@@ -64,37 +64,48 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
             audio_path = self.audio_files[idx]
             logger.debug(f'Loading {audio_path}')
             
-            # Load audio file with soundfile (supports multi-channel)
-            audio_data, sample_rate = sf.read(audio_path)
+            # First, get file info to determine number of channels
+            info = sf.info(audio_path)
+            num_channels = info.channels
+            file_duration = info.frames / info.samplerate
+            
+            # Randomly select one channel (1-32, 0-indexed as 0-31)
+            # If file has fewer channels, cycle through them
+            channel_idx = random.randint(0, min(31, num_channels - 1))
+            
+            # Randomly select start time for 1-second segment
+            max_start_time = max(0, file_duration - 1.0)  # Leave 1 second at end
+            start_time = random.uniform(0, max_start_time)
+            
+            # Load only the specific channel and segment
+            # soundfile.read can load specific channels and time ranges
+            audio_data, sample_rate = sf.read(
+                audio_path, 
+                start=int(start_time * info.samplerate),
+                frames=int(1.0 * info.samplerate),  # 1 second
+                always_2d=False  # Get 1D array for single channel
+            )
+            
+            # If we got 2D array, take the specific channel
+            if len(audio_data.shape) == 2:
+                audio_data = audio_data[:, channel_idx]
             
             # Convert to torch tensor
             if isinstance(audio_data, np.ndarray):
                 audio_data = torch.from_numpy(audio_data).float()
             
-            # Handle different audio shapes
-            if len(audio_data.shape) == 1:
-                # Mono audio - expand to 32 channels (duplicate)
-                audio_data = audio_data.unsqueeze(0).expand(32, -1)
-            elif len(audio_data.shape) == 2:
-                # Multi-channel audio - transpose to [channels, samples]
-                if audio_data.shape[0] > audio_data.shape[1]:
-                    audio_data = audio_data.T
-                # Ensure we have at least 32 channels (pad if necessary)
-                if audio_data.shape[0] < 32:
-                    padding = torch.zeros(32 - audio_data.shape[0], audio_data.shape[1])
-                    audio_data = torch.cat([audio_data, padding], dim=0)
-                elif audio_data.shape[0] > 32:
-                    # If more than 32 channels, take first 32
-                    audio_data = audio_data[:32]
-            else:
-                raise ValueError(f"Unexpected audio shape: {audio_data.shape}")
-            
-            # Randomly select one channel (1-32, 0-indexed as 0-31)
-            channel_idx = random.randint(0, 31)
-            mono_audio = audio_data[channel_idx]  # Shape: [samples]
+            # Ensure we have exactly 1 second of audio
+            target_length = int(1.0 * self.sample_rate)
+            if len(audio_data) < target_length:
+                # Pad with zeros if too short
+                padding = torch.zeros(target_length - len(audio_data))
+                audio_data = torch.cat([audio_data, padding])
+            elif len(audio_data) > target_length:
+                # Truncate if too long
+                audio_data = audio_data[:target_length]
             
             # Convert to mono tensor with channel dimension
-            mono_audio = mono_audio.unsqueeze(0)  # Shape: [1, samples]
+            mono_audio = audio_data.unsqueeze(0)  # Shape: [1, samples]
             
             # Resample if necessary
             if sample_rate != self.sample_rate:
