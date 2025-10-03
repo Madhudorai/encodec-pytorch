@@ -17,8 +17,8 @@ def similarity_loss(embeddings1, embeddings2, token_idx=0):
         return torch.tensor(0.0, device=embeddings1[0].device, requires_grad=True)
     
     # Get the first token embeddings (shape: [B, D, T])
-    token1 = embeddings1[token_idx]  # First codebook embedding
-    token2 = embeddings2[token_idx]  # First codebook embedding
+    token1 = embeddings1[token_idx].float()  # First codebook embedding
+    token2 = embeddings2[token_idx].float()  # First codebook embedding
     
     # Compute L2 loss between the embeddings
     l2_loss = F.mse_loss(token1, token2)
@@ -41,8 +41,8 @@ def diversity_loss(embeddings1, embeddings2, token_idx=1):
         return torch.tensor(0.0, device=embeddings1[0].device, requires_grad=True)
     
     # Get the second token embeddings (shape: [B, D, T])
-    token1 = embeddings1[token_idx]  # Second codebook embedding
-    token2 = embeddings2[token_idx]  # Second codebook embedding
+    token1 = embeddings1[token_idx].float()  # Second codebook embedding
+    token2 = embeddings2[token_idx].float()  # Second codebook embedding
     
     # Compute negative L2 loss (maximize distance)
     # We use negative MSE to encourage diversity
