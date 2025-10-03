@@ -176,8 +176,8 @@ def train_one_step_paired(epoch, optimizer, optimizer_disc, model, disc_model, t
                 f"Epoch {epoch} {idx+1}/{data_length}\t"
                 f"Avg loss_G: {accumulated_loss_g / (idx + 1):.4f}\t"
                 f"Avg loss_W: {accumulated_loss_w / (idx + 1):.4f}\t"
-                f"Avg loss_sim: {accumulated_loss_sim / (idx + 1):.4f}\t"
-                f"Avg loss_div: {accumulated_loss_div / (idx + 1):.4f}\t"
+                f"Avg loss_sim: {accumulated_loss_sim / (idx + 1):.6e}\t"
+                f"Avg loss_div: {accumulated_loss_div / (idx + 1):.6e}\t"
                 f"lr_G: {optimizer.param_groups[0]['lr']:.6e}\t"
                 f"lr_D: {optimizer_disc.param_groups[0]['lr']:.6e}\t"
             ) 
