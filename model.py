@@ -224,7 +224,8 @@ class EncodecModel(nn.Module):
                 quantized_embeddings = []
                 for emb, scale in frames:
                     # Create dummy quantized embedding with same shape as encoder output
-                    dummy_emb = torch.zeros_like(emb)
+                    # Ensure it's float type for loss computation
+                    dummy_emb = torch.zeros_like(emb, dtype=torch.float32)
                     quantized_embeddings.append(dummy_emb)
                 return output, quantized_embeddings
             else:
