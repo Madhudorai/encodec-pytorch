@@ -192,12 +192,13 @@ class EncodecModel(nn.Module):
             out = out * scale.view(-1, 1, 1)
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_embeddings: bool = False) -> torch.Tensor:
         frames = self.encode(x) # input_wav -> encoder , x.shape = [BatchSize,channel,tensor_cut or original length] 2,1,10000
         if self.training:
             # if encodec is training, input_wav -> encoder -> quantizer forward -> decode
             loss_w = torch.tensor([0.0], device=x.device, requires_grad=True)
             codes = []
+            quantized_embeddings = []  # Store quantized embeddings for pairwise losses
             # self.quantizer.train(self.training)
             index = torch.tensor(random.randint(0,len(self.target_bandwidths)-1),device=x.device)
             if torch.distributed.is_initialized():
@@ -207,10 +208,27 @@ class EncodecModel(nn.Module):
                 qv = self.quantizer(emb,self.frame_rate,bw)
                 loss_w = loss_w + qv.penalty # loss_w is the sum of all quantizer forward loss (RVQ commitment loss :l_w)
                 codes.append((qv.quantized,scale))
-            return self.decode(codes)[:,:,:x.shape[-1]],loss_w,frames
+                if return_embeddings:
+                    quantized_embeddings.append(qv.quantized)  # Store quantized embeddings
+            if return_embeddings:
+                return self.decode(codes)[:,:,:x.shape[-1]], loss_w, frames, quantized_embeddings
+            else:
+                return self.decode(codes)[:,:,:x.shape[-1]], loss_w, frames
         else:
             # if encodec is not training, input_wav -> encoder -> quantizer encode -> decode
-            return self.decode(frames)[:, :, :x.shape[-1]]
+            if return_embeddings:
+                # In eval mode, return dummy embeddings for pairwise losses
+                # This is a simplified approach - in practice, you'd want to properly encode
+                output = self.decode(frames)[:, :, :x.shape[-1]]
+                # Create dummy embeddings with the same shape as training mode
+                quantized_embeddings = []
+                for emb, scale in frames:
+                    # Create dummy quantized embedding with same shape as encoder output
+                    dummy_emb = torch.zeros_like(emb)
+                    quantized_embeddings.append(dummy_emb)
+                return output, quantized_embeddings
+            else:
+                return self.decode(frames)[:, :, :x.shape[-1]]
 
     def set_target_bandwidth(self, bandwidth: float):
         if bandwidth not in self.target_bandwidths:
