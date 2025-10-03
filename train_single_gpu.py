@@ -177,12 +177,7 @@ def test(epoch, model, disc_model, testloader, config, wandb_logger=None):
     input_wav = input_wav.cuda()
     output = model(input_wav.unsqueeze(0)).squeeze(0)
     
-    # Save audio samples
-    sp = Path(config.checkpoint.save_folder)
-    gt_path = sp/f'GT_epoch{epoch}.wav'
-    recon_path = sp/f'Reconstruction_epoch{epoch}.wav'
-    torchaudio.save(gt_path, input_wav.cpu(), config.model.sample_rate)
-    torchaudio.save(recon_path, output.cpu(), config.model.sample_rate)
+    # Audio samples are logged to WandB - no need to save disk files
     
     # Log audio samples to wandb
     if wandb_logger:
