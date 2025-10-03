@@ -9,7 +9,6 @@ import hydra
 import torch
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 import torchaudio
 import wandb
 
@@ -28,7 +27,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Define train one step function
-def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloader, config, scheduler, disc_scheduler, scaler=None, scaler_disc=None, writer=None, balancer=None, wandb_logger=None):
+def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloader, config, scheduler, disc_scheduler, scaler=None, scaler_disc=None, balancer=None, wandb_logger=None):
     """train one step function
 
     Args:
@@ -43,7 +42,6 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         disc_scheduler (_type_): adjust discriminator model learning rate
         scaler (_type_): gradient scaler for mixed precision
         scaler_disc (_type_): gradient scaler for discriminator
-        writer (_type_): tensorboard writer
         balancer (_type_): loss balancer
     """
     model.train()
@@ -126,14 +124,6 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                 f"Epoch {epoch} {idx+1}/{data_length}\tAvg loss_G: {accumulated_loss_g / (idx + 1):.4f}\tAvg loss_W: {accumulated_loss_w / (idx + 1):.4f}\tlr_G: {optimizer.param_groups[0]['lr']:.6e}\tlr_D: {optimizer_disc.param_groups[0]['lr']:.6e}\t"  
             ) 
             
-            # TensorBoard logging
-            if writer:
-                writer.add_scalar('Train/Loss_G', accumulated_loss_g / (idx + 1), (epoch-1) * len(trainloader) + idx)  
-                for k, l in accumulated_losses_g.items():
-                    writer.add_scalar(f'Train/{k}', l / (idx + 1), (epoch-1) * len(trainloader) + idx)
-                writer.add_scalar('Train/Loss_W', accumulated_loss_w / (idx + 1), (epoch-1) * len(trainloader) + idx) 
-                if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
-                    writer.add_scalar('Train/Loss_Disc', accumulated_loss_disc / (idx + 1), (epoch-1) * len(trainloader) + idx) 
             
             # Weights & Biases logging
             if wandb_logger:
@@ -155,7 +145,7 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             logger.info(log_msg) 
 
 @torch.no_grad()
-def test(epoch, model, disc_model, testloader, config, writer, wandb_logger=None):
+def test(epoch, model, disc_model, testloader, config, wandb_logger=None):
     model.eval()
     for idx, input_wav in enumerate(testloader):
         input_wav = input_wav.cuda()
@@ -168,11 +158,6 @@ def test(epoch, model, disc_model, testloader, config, writer, wandb_logger=None
 
     log_msg = (f'| TEST | epoch: {epoch} | loss_g: {sum([l.item() for l in losses_g.values()])} | loss_disc: {loss_disc.item():.4f}') 
     
-    # TensorBoard logging
-    if writer:
-        for k, l in losses_g.items():
-            writer.add_scalar(f'Test/{k}', l.item(), epoch)  
-        writer.add_scalar('Test/Loss_Disc', loss_disc.item(), epoch)
     
     # Weights & Biases logging
     if wandb_logger:
@@ -201,10 +186,23 @@ def test(epoch, model, disc_model, testloader, config, writer, wandb_logger=None
     
     # Log audio samples to wandb
     if wandb_logger:
-        wandb_logger.log({
-            'audio/ground_truth': wandb.Audio(gt_path, sample_rate=config.model.sample_rate),
-            'audio/reconstruction': wandb.Audio(recon_path, sample_rate=config.model.sample_rate),
-        })
+        try:
+            # Ensure audio tensors are properly formatted for wandb
+            input_audio = input_wav.cpu().squeeze()  # Remove batch and channel dimensions if present
+            output_audio = output.cpu().squeeze()    # Remove batch and channel dimensions if present
+            
+            # Ensure audio is 1D for wandb
+            if input_audio.dim() > 1:
+                input_audio = input_audio.squeeze()
+            if output_audio.dim() > 1:
+                output_audio = output_audio.squeeze()
+            
+            wandb_logger.log({
+                'audio/ground_truth': wandb.Audio(input_audio.numpy(), sample_rate=config.model.sample_rate),
+                'audio/reconstruction': wandb.Audio(output_audio.numpy(), sample_rate=config.model.sample_rate),
+            })
+        except Exception as e:
+            logger.warning(f"Failed to log audio to wandb: {e}")
 
 def train(config):
     """train main function."""
@@ -335,8 +333,6 @@ def train(config):
         disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
         logger.info(f"load optimizer and disc_optimizer state_dict from {resume_epoch}")
 
-    writer = SummaryWriter(log_dir=f'{config.checkpoint.save_folder}/runs')  
-    logger.info(f'Saving tensorboard logs to {Path(writer.log_dir).resolve()}')
     
     start_epoch = max(1, resume_epoch+1) # start epoch is 1 if not resume
     # instantiate loss balancer
@@ -344,16 +340,16 @@ def train(config):
     if balancer:
         logger.info(f'Loss balancer with weights {balancer.weights} instantiated')
     
-    test(0, model, disc_model, testloader, config, writer, wandb_logger)
+    test(0, model, disc_model, testloader, config, wandb_logger)
     
     for epoch in range(start_epoch, config.common.max_epoch+1):
         train_one_step(
             epoch, optimizer, optimizer_disc, 
             model, disc_model, trainloader, config,
-            scheduler, disc_scheduler, scaler, scaler_disc, writer, balancer, wandb_logger)
+            scheduler, disc_scheduler, scaler, scaler_disc, balancer, wandb_logger)
         
         if epoch % config.common.test_interval == 0:
-            test(epoch, model, disc_model, testloader, config, writer, wandb_logger)
+            test(epoch, model, disc_model, testloader, config, wandb_logger)
         
         # save checkpoint and epoch
         if epoch % config.common.save_interval == 0:
