@@ -209,7 +209,17 @@ class EncodecModel(nn.Module):
                 loss_w = loss_w + qv.penalty # loss_w is the sum of all quantizer forward loss (RVQ commitment loss :l_w)
                 codes.append((qv.quantized,scale))
                 if return_embeddings:
-                    quantized_embeddings.append(qv.quantized)  # Store quantized embeddings
+                    # Get individual quantized embeddings from each codebook
+                    # We need to manually compute these since the quantizer only returns the final result
+                    residual = emb
+                    frame_embeddings = []
+                    for i in range(self.quantizer.n_q):
+                        if i < len(self.quantizer.vq.layers):
+                            layer = self.quantizer.vq.layers[i]
+                            quantized, indices, loss = layer(residual)
+                            frame_embeddings.append(quantized)
+                            residual = residual - quantized.detach()
+                    quantized_embeddings.extend(frame_embeddings)
             if return_embeddings:
                 return self.decode(codes)[:,:,:x.shape[-1]], loss_w, frames, quantized_embeddings
             else:
