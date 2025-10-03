@@ -264,17 +264,7 @@ def test_paired(epoch, model, disc_model, testloader, config, wandb_logger=None)
     output1 = model(input_wav1.unsqueeze(0), return_embeddings=True)[0].squeeze(0)
     output2 = model(input_wav2.unsqueeze(0), return_embeddings=True)[0].squeeze(0)
     
-    # Save audio samples
-    sp = Path(config.checkpoint.save_folder)
-    gt_path1 = sp/f'GT_ch1_epoch{epoch}.wav'
-    recon_path1 = sp/f'Reconstruction_ch1_epoch{epoch}.wav'
-    gt_path2 = sp/f'GT_ch2_epoch{epoch}.wav'
-    recon_path2 = sp/f'Reconstruction_ch2_epoch{epoch}.wav'
-    
-    torchaudio.save(gt_path1, input_wav1.cpu(), config.model.sample_rate)
-    torchaudio.save(recon_path1, output1.cpu(), config.model.sample_rate)
-    torchaudio.save(gt_path2, input_wav2.cpu(), config.model.sample_rate)
-    torchaudio.save(recon_path2, output2.cpu(), config.model.sample_rate)
+    # Audio samples are logged to WandB - no need to save disk files
     
     # Log audio samples to wandb
     if wandb_logger:

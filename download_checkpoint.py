@@ -15,7 +15,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def download_checkpoint(entity, project, run_id, epoch, save_dir="./checkpoints_mono_nq2/"):
+def download_checkpoint(entity, project, run_id, epoch, save_dir="./checkpoints_mono_nq2/", training_mode="mono"):
     """
     Download checkpoints for a specific epoch from a W&B run.
     
@@ -25,6 +25,7 @@ def download_checkpoint(entity, project, run_id, epoch, save_dir="./checkpoints_
         run_id (str): W&B run ID
         epoch (int): Epoch number to download
         save_dir (str): Directory to save the downloaded checkpoints
+        training_mode (str): "mono" or "paired" - determines checkpoint file naming
     """
     try:
         # Initialize wandb API
@@ -39,11 +40,17 @@ def download_checkpoint(entity, project, run_id, epoch, save_dir="./checkpoints_
         # Create save directory if it doesn't exist
         os.makedirs(save_dir, exist_ok=True)
         
-        # Target checkpoint files
-        checkpoint_files = [
-            f"bs16_cut24000_length27600_epoch{epoch}_disc_lr0.0003.pt",
-            f"bs16_cut24000_length27600_epoch{epoch}_lr0.0003.pt"
-        ]
+        # Target checkpoint files based on training mode
+        if training_mode == "paired":
+            checkpoint_files = [
+                f"bs8_cut24000_length13800_epoch{epoch}_disc_lr0.0003.pt",
+                f"bs8_cut24000_length13800_epoch{epoch}_lr0.0003.pt"
+            ]
+        else:  # mono
+            checkpoint_files = [
+                f"bs16_cut24000_length27600_epoch{epoch}_disc_lr0.0003.pt",
+                f"bs16_cut24000_length27600_epoch{epoch}_lr0.0003.pt"
+            ]
         
         downloaded_files = []
         
@@ -61,6 +68,12 @@ def download_checkpoint(entity, project, run_id, epoch, save_dir="./checkpoints_
                     if matching_files:
                         downloaded_files.extend(matching_files)
                         logger.info(f"✓ Found {checkpoint_file}")
+                    else:
+                        # Also look for files with similar patterns (in case naming is different)
+                        pattern_files = list(artifact_path.rglob(f"*epoch{epoch}*.pt"))
+                        if pattern_files:
+                            downloaded_files.extend(pattern_files)
+                            logger.info(f"✓ Found similar file: {pattern_files[0].name}")
                 
                 break  # Found our target epoch, no need to check other artifacts
             else:
@@ -85,11 +98,12 @@ def main():
     parser.add_argument("--run_id", default="s2pnxx7w", help="W&B run ID")
     parser.add_argument("--epoch", type=int, default=74, help="Epoch number to download")
     parser.add_argument("--save_dir", default="/user/i/iran/encodec-pytorch/checkpoints_mono_nq2/", help="Directory to save checkpoints")
+    parser.add_argument("--mode", choices=["mono", "paired"], default="mono", help="Training mode: mono or paired")
     
     args = parser.parse_args()
     
-    logger.info(f"Downloading epoch {args.epoch} checkpoints from {args.entity}/{args.project}")
-    downloaded_files = download_checkpoint(args.entity, args.project, args.run_id, args.epoch, args.save_dir)
+    logger.info(f"Downloading epoch {args.epoch} checkpoints from {args.entity}/{args.project} ({args.mode} mode)")
+    downloaded_files = download_checkpoint(args.entity, args.project, args.run_id, args.epoch, args.save_dir, args.mode)
     
     if downloaded_files:
         logger.info(f"✅ Successfully downloaded {len(downloaded_files)} checkpoint files:")
