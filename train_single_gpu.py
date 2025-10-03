@@ -284,14 +284,37 @@ def train(config):
         assert config.checkpoint.checkpoint_path != '', "resume path is empty"
         assert config.checkpoint.disc_checkpoint_path != '', "disc resume path is empty"
 
+        # Check if checkpoint files exist
+        if not os.path.exists(config.checkpoint.checkpoint_path):
+            raise FileNotFoundError(f"Model checkpoint not found: {config.checkpoint.checkpoint_path}")
+        if not os.path.exists(config.checkpoint.disc_checkpoint_path):
+            raise FileNotFoundError(f"Discriminator checkpoint not found: {config.checkpoint.disc_checkpoint_path}")
+
+        logger.info(f"Loading model checkpoint from: {config.checkpoint.checkpoint_path}")
+        logger.info(f"Loading discriminator checkpoint from: {config.checkpoint.disc_checkpoint_path}")
+
         model_checkpoint = torch.load(config.checkpoint.checkpoint_path, map_location='cpu')
         disc_model_checkpoint = torch.load(config.checkpoint.disc_checkpoint_path, map_location='cpu')
+        
+        # Validate checkpoint structure
+        if 'model_state_dict' not in model_checkpoint:
+            raise KeyError("Model checkpoint missing 'model_state_dict' key")
+        if 'model_state_dict' not in disc_model_checkpoint:
+            raise KeyError("Discriminator checkpoint missing 'model_state_dict' key")
+        if 'epoch' not in model_checkpoint:
+            raise KeyError("Model checkpoint missing 'epoch' key")
+        
         model.load_state_dict(model_checkpoint['model_state_dict'])
         disc_model.load_state_dict(disc_model_checkpoint['model_state_dict'])
         resume_epoch = model_checkpoint['epoch']
+        
         if resume_epoch >= config.common.max_epoch:
             raise ValueError(f"resume epoch {resume_epoch} is larger than total epochs {config.common.max_epoch}")
-        logger.info(f"load checkpoint of model and disc_model, resume from {resume_epoch}")
+        
+        logger.info(f"✓ Successfully loaded checkpoints and resuming from epoch {resume_epoch}")
+        logger.info(f"  - Model checkpoint epoch: {resume_epoch}")
+        logger.info(f"  - Total epochs to train: {config.common.max_epoch}")
+        logger.info(f"  - Epochs remaining: {config.common.max_epoch - resume_epoch}")
 
     model.cuda()
     disc_model.cuda()
