@@ -120,14 +120,17 @@ def train_one_step_paired(epoch, optimizer, optimizer_disc, model, disc_model, t
                 loss_g1 = 3*losses_g1['l_g'] + 3*losses_g1['l_feat'] + losses_g1['l_t']/10 + losses_g1['l_f'] 
                 loss_g2 = 3*losses_g2['l_g'] + 3*losses_g2['l_feat'] + losses_g2['l_t']/10 + losses_g2['l_f']
             
-            loss_g = loss_g1 + loss_g2 + pairwise_losses_dict['l_sim'] + pairwise_losses_dict['l_div']
-            loss_g.backward()
-            loss_w1.backward()
-            loss_w2.backward()
+            # Combine all losses into a single backward pass
+            combined_loss = loss_g1 + loss_g2 + loss_w1 + loss_w2 + pairwise_losses_dict['l_sim'] + pairwise_losses_dict['l_div']
+            combined_loss.backward()
             optimizer.step()
 
         # Accumulate losses  
-        accumulated_loss_g += loss_g.item()
+        if config.common.amp:
+            accumulated_loss_g += loss_g.item()
+        else:
+            accumulated_loss_g += combined_loss.item()
+        
         for k, l in losses_g1.items():
             accumulated_losses_g[k] += l.item()
         for k, l in losses_g2.items():
