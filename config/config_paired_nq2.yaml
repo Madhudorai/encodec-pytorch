@@ -1,6 +1,7 @@
 common:
   save_interval: 2
-  test_interval: 10
+  test_interval: 10  # Test every 10 epochs
+  val_interval: 5   # Validation every 5 epochs
   log_interval: 100
   max_epoch: 300
   seed: 3401
@@ -11,7 +12,7 @@ datasets:
   batch_size: 8  # Reduced batch size for paired training (2x data per batch)
   tensor_cut: 24000  # 1 second at 24kHz
   num_workers: 4
-  fixed_length: 13800  # Half of original since we process pairs
+  fixed_length: 16000  # Adjusted for 2000 batches per epoch with pairs
   pin_memory: True
 
 checkpoint:
@@ -36,9 +37,9 @@ model:
   audio_normalize: True
   filters: 32
   ratios: [8, 5, 4, 2]
-  disc_win_lengths: [1024, 2048, 512]
-  disc_hop_lengths: [256, 512, 128]
-  disc_n_ffts: [1024, 2048, 512]
+  disc_win_lengths: [2048, 1024, 512, 256, 128]
+  disc_hop_lengths: [512, 256, 128, 64, 32]
+  disc_n_ffts: [2048, 1024, 512, 256, 128]
   causal: True
   norm: 'weight_norm'
   segment: None
@@ -47,7 +48,7 @@ model:
 
 # New pairwise loss configuration
 pairwise:
-  sim_weight: 0.5  # Weight for similarity loss (first token)
+  sim_weight: 5.0  # Weight for similarity loss (first token) - increased to dominate training
   div_weight: 0.5  # Weight for diversity loss (second token)
 
 distributed:

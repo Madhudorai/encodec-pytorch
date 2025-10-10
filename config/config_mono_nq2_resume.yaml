@@ -11,7 +11,7 @@ datasets:
   batch_size: 16  # Increased batch size for better GPU utilization
   tensor_cut: 24000  # 1 second at 24kHz
   num_workers: 4
-  fixed_length: 27600  # Use all 27,600 seconds of audio data per epoch
+  fixed_length: 32000  # Use 32,000 samples for 2000 batches per epoch
   pin_memory: True
 
 checkpoint:
@@ -36,9 +36,9 @@ model:
   audio_normalize: True
   filters: 32
   ratios: [8, 5, 4, 2]
-  disc_win_lengths: [1024, 2048, 512]
-  disc_hop_lengths: [256, 512, 128]
-  disc_n_ffts: [1024, 2048, 512]
+  disc_win_lengths: [2048, 1024, 512, 256, 128]
+  disc_hop_lengths: [512, 256, 128, 64, 32]
+  disc_n_ffts: [2048, 1024, 512, 256, 128]
   causal: True
   norm: 'weight_norm'
   segment: None

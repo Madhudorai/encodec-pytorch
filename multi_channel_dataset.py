@@ -17,7 +17,7 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
     """Custom dataset for 32-channel audio files with mono segment extraction."""
     
     def __init__(self, config, transform=None, mode='train'):
-        assert mode in ['train', 'test'], 'dataset mode must be train or test'
+        assert mode in ['train', 'val', 'test'], 'dataset mode must be train, val, or test'
         
         self.data_root = config.datasets.data_root
         self.sample_rate = config.model.sample_rate
@@ -30,8 +30,10 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
         # Define folder splits
         if mode == 'train':
             self.folders = ['Beach', 'Busy Street', 'Park', 'Pedestrian Zone', 'Quiet Street', 'Shopping Centre']
-        else:  # test/validation
-            self.folders = ['Woodland', 'Train Station']
+        elif mode == 'val':
+            self.folders = ['Woodland']  # Validation data
+        else:  # test
+            self.folders = ['Train Station']  # Test data
         
         # Collect all audio files from specified folders
         self.audio_files = []
@@ -48,22 +50,26 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
         if len(self.audio_files) == 0:
             raise ValueError(f"No audio files found in folders: {self.folders}")
         
-        # For validation, create fixed segments
-        if mode == 'test':
+        # For validation and test, create fixed segments
+        if mode in ['val', 'test']:
             self.fixed_segments = self._create_fixed_validation_segments()
         
         logger.info(f"Found {len(self.audio_files)} audio files for {mode} mode")
         logger.info(f"Folders: {self.folders}")
 
     def __len__(self):
-        return self.fixed_length if self.fixed_length > 0 else len(self.audio_files)
+        if self.mode in ['val', 'test']:
+            return 10000  # 10,000 fixed segments for validation and testing
+        else:
+            return self.fixed_length if self.fixed_length > 0 else len(self.audio_files)
 
     def _create_fixed_validation_segments(self):
-        """Create fixed validation segments for consistent evaluation."""
+        """Create fixed validation/test segments for consistent evaluation."""
         fixed_segments = []
-        random.seed(42)  # Fixed seed for reproducible validation
+        random.seed(42)  # Fixed seed for reproducible evaluation
         
-        for i in range(min(100, len(self.audio_files))):  # Use up to 100 validation segments
+        # Create 10,000 fixed segments
+        for i in range(10000):
             audio_path = self.audio_files[i % len(self.audio_files)]
             
             # Get file info
@@ -71,10 +77,10 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
             num_channels = info.channels
             file_duration = info.frames / info.samplerate
             
-            # Fixed channel and time selection
-            channel_idx = i % min(32, num_channels)
+            # Random but fixed channel and time selection
+            channel_idx = random.randint(0, min(31, num_channels - 1))
             max_start_time = max(0, file_duration - 1.0)
-            start_time = (i * 0.1) % max_start_time  # Fixed pattern
+            start_time = random.uniform(0, max_start_time)
             
             fixed_segments.append({
                 'audio_path': audio_path,
@@ -94,8 +100,8 @@ class MultiChannelAudioDataset(torch.utils.data.Dataset):
             idx = random.randrange(len(self))
         
         try:
-            # For validation, use fixed segments
-            if self.mode == 'test' and hasattr(self, 'fixed_segments'):
+            # For validation and test, use fixed segments
+            if self.mode in ['val', 'test'] and hasattr(self, 'fixed_segments'):
                 segment = self.fixed_segments[idx % len(self.fixed_segments)]
                 audio_path = segment['audio_path']
                 channel_idx = segment['channel_idx']

@@ -17,7 +17,7 @@ class PairedChannelDataset(torch.utils.data.Dataset):
     """Custom dataset for paired channel audio files with same time segment from two different channels."""
     
     def __init__(self, config, transform=None, mode='train'):
-        assert mode in ['train', 'test'], 'dataset mode must be train or test'
+        assert mode in ['train', 'val', 'test'], 'dataset mode must be train, val, or test'
         
         self.data_root = config.datasets.data_root
         self.sample_rate = config.model.sample_rate
@@ -27,11 +27,13 @@ class PairedChannelDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.mode = mode
         
-        # Define folder splits (same as original)
+        # Define folder splits
         if mode == 'train':
             self.folders = ['Beach', 'Busy Street', 'Park', 'Pedestrian Zone', 'Quiet Street', 'Shopping Centre']
-        else:  # test/validation
-            self.folders = ['Woodland', 'Train Station']
+        elif mode == 'val':
+            self.folders = ['Woodland']  # Validation data
+        else:  # test
+            self.folders = ['Train Station']  # Test data
         
         # Collect all audio files from specified folders
         self.audio_files = []
@@ -48,8 +50,8 @@ class PairedChannelDataset(torch.utils.data.Dataset):
         if len(self.audio_files) == 0:
             raise ValueError(f"No audio files found in folders: {self.folders}")
         
-        # For validation, create fixed pairs
-        if mode == 'test':
+        # For validation and test, create fixed pairs
+        if mode in ['val', 'test']:
             self.fixed_pairs = self._create_fixed_validation_pairs()
         
         logger.info(f"Found {len(self.audio_files)} audio files for {mode} mode")

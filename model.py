@@ -227,16 +227,16 @@ class EncodecModel(nn.Module):
         else:
             # if encodec is not training, input_wav -> encoder -> quantizer encode -> decode
             if return_embeddings:
-                # In eval mode, return dummy embeddings for pairwise losses
-                # This is a simplified approach - in practice, you'd want to properly encode
+                # In eval mode, compute real quantized embeddings for pairwise losses
                 output = self.decode(frames)[:, :, :x.shape[-1]]
-                # Create dummy embeddings with the same shape as training mode
+                # Get real quantized embeddings by encoding the frames
                 quantized_embeddings = []
                 for emb, scale in frames:
-                    # Create dummy quantized embedding with same shape as encoder output
-                    # Ensure it's float type for loss computation
-                    dummy_emb = torch.zeros_like(emb, dtype=torch.float32)
-                    quantized_embeddings.append(dummy_emb)
+                    # Encode to get real quantized embeddings
+                    encoded_frame = self.quantizer.encode(emb, self.frame_rate, self.target_bandwidths[-1])
+                    # Decode to get quantized embeddings
+                    quantized_emb = self.quantizer.decode(encoded_frame)
+                    quantized_embeddings.append(quantized_emb)
                 return output, quantized_embeddings
             else:
                 return self.decode(frames)[:, :, :x.shape[-1]]
