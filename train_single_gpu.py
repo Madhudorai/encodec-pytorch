@@ -20,6 +20,7 @@ from msstftd import MultiScaleSTFTDiscriminator
 from scheduler import WarmupCosineLrScheduler
 from utils import (count_parameters, save_master_checkpoint, set_seed)
 from balancer import Balancer
+from cal_metrics import calculate_si_snr
 
 warnings.filterwarnings("ignore")
 
@@ -119,74 +120,142 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         scheduler.step()
         disc_scheduler.step()
 
-        if idx % config.common.log_interval == 0 or idx == data_length - 1: 
-            log_msg = (  
-                f"Epoch {epoch} {idx+1}/{data_length}\tAvg loss_G: {accumulated_loss_g / (idx + 1):.4f}\tAvg loss_W: {accumulated_loss_w / (idx + 1):.4f}\tlr_G: {optimizer.param_groups[0]['lr']:.6e}\tlr_D: {optimizer_disc.param_groups[0]['lr']:.6e}\t"  
-            ) 
-            
-            
-            # Weights & Biases logging
-            if wandb_logger:
-                log_dict = {
-                    'epoch': epoch,
-                    'step': (epoch-1) * len(trainloader) + idx,
-                    'train/loss_g': accumulated_loss_g / (idx + 1),
-                    'train/loss_w': accumulated_loss_w / (idx + 1),
-                    'train/lr_g': optimizer.param_groups[0]['lr'],
-                    'train/lr_d': optimizer_disc.param_groups[0]['lr'],
-                }
-                for k, l in accumulated_losses_g.items():
-                    log_dict[f'train/{k}'] = l / (idx + 1)
-                if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
-                    log_dict['train/loss_disc'] = accumulated_loss_disc / (idx + 1)
-                    log_msg += f"loss_disc: {accumulated_loss_disc / (idx + 1) :.4f}"  
-                wandb_logger.log(log_dict)
-            
-            logger.info(log_msg) 
+    # Print epoch summary at the end
+    avg_loss_g = accumulated_loss_g / data_length
+    avg_loss_w = accumulated_loss_w / data_length
+    avg_loss_disc = accumulated_loss_disc / data_length if accumulated_loss_disc > 0 else 0.0
+    
+    log_msg = f"| TRAIN | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_w: {avg_loss_w:.4f} | lr_G: {optimizer.param_groups[0]['lr']:.6e} | lr_D: {optimizer_disc.param_groups[0]['lr']:.6e}"
+    
+    if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
+        log_msg += f" | loss_disc: {avg_loss_disc:.4f}"
+    
+    logger.info(log_msg)
+    
+    # Weights & Biases logging
+    if wandb_logger:
+        log_dict = {
+            'epoch': epoch,
+            'train/loss_g': avg_loss_g,
+            'train/loss_w': avg_loss_w,
+            'train/lr_g': optimizer.param_groups[0]['lr'],
+            'train/lr_d': optimizer_disc.param_groups[0]['lr'],
+        }
+        for k, l in accumulated_losses_g.items():
+            log_dict[f'train/{k}'] = l / data_length
+        if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
+            log_dict['train/loss_disc'] = avg_loss_disc
+        wandb_logger.log(log_dict) 
 
 @torch.no_grad()
-def test(epoch, model, disc_model, testloader, config, wandb_logger=None):
+def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
+    """Simple validation function"""
     model.eval()
-    for idx, input_wav in enumerate(testloader):
+    disc_model.eval()
+    
+    total_loss_g = 0.0
+    total_loss_disc = 0.0
+    total_si_snr = 0.0
+    num_samples = 0
+    
+    for idx, input_wav in enumerate(valloader):
         input_wav = input_wav.cuda()
-
+        
         output = model(input_wav)
         logits_real, fmap_real = disc_model(input_wav)
         logits_fake, fmap_fake = disc_model(output)
-        loss_disc = disc_loss(logits_real, logits_fake) # compute discriminator loss
-        losses_g = total_loss(fmap_real, logits_fake, fmap_fake, input_wav, output) 
-
-    log_msg = (f'| TEST | epoch: {epoch} | loss_g: {sum([l.item() for l in losses_g.values()])} | loss_disc: {loss_disc.item():.4f}') 
+        loss_disc = disc_loss(logits_real, logits_fake)
+        losses_g = total_loss(fmap_real, logits_fake, fmap_fake, input_wav, output)
+        
+        total_loss_g += sum([l.item() for l in losses_g.values()])
+        total_loss_disc += loss_disc.item()
+        
+        # Calculate SI-SNR for each sample in batch
+        batch_size = input_wav.shape[0]
+        for i in range(batch_size):
+            ref_sample = input_wav[i].squeeze().cpu()
+            rec_sample = output[i].squeeze().cpu()
+            si_snr_val = calculate_si_snr(ref_sample, rec_sample)
+            total_si_snr += si_snr_val
+            num_samples += 1
     
+    avg_loss_g = total_loss_g / len(valloader)
+    avg_loss_disc = total_loss_disc / len(valloader)
+    avg_si_snr = total_si_snr / num_samples
+    
+    log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB"
+    logger.info(log_msg)
+    
+    # Weights & Biases logging
+    if wandb_logger:
+        val_log_dict = {
+            'epoch': epoch,
+            'val/loss_g': avg_loss_g,
+            'val/loss_disc': avg_loss_disc,
+            'val/si_snr': avg_si_snr,
+        }
+        wandb_logger.log(val_log_dict)
+
+@torch.no_grad()
+def test(epoch, model, disc_model, testloader, config, wandb_logger=None):
+    """Simple test function with SI-SNR metrics"""
+    model.eval()
+    disc_model.eval()
+    
+    total_loss_g = 0.0
+    total_loss_disc = 0.0
+    total_si_snr = 0.0
+    num_samples = 0
+    
+    for idx, input_wav in enumerate(testloader):
+        input_wav = input_wav.cuda()
+        
+        output = model(input_wav)
+        logits_real, fmap_real = disc_model(input_wav)
+        logits_fake, fmap_fake = disc_model(output)
+        loss_disc = disc_loss(logits_real, logits_fake)
+        losses_g = total_loss(fmap_real, logits_fake, fmap_fake, input_wav, output)
+        
+        total_loss_g += sum([l.item() for l in losses_g.values()])
+        total_loss_disc += loss_disc.item()
+        
+        # Calculate SI-SNR for each sample in batch
+        batch_size = input_wav.shape[0]
+        for i in range(batch_size):
+            ref_sample = input_wav[i].squeeze().cpu()
+            rec_sample = output[i].squeeze().cpu()
+            si_snr_val = calculate_si_snr(ref_sample, rec_sample)
+            total_si_snr += si_snr_val
+            num_samples += 1
+    
+    avg_loss_g = total_loss_g / len(testloader)
+    avg_loss_disc = total_loss_disc / len(testloader)
+    avg_si_snr = total_si_snr / num_samples
+    
+    log_msg = f"| TEST | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB"
+    logger.info(log_msg)
     
     # Weights & Biases logging
     if wandb_logger:
         test_log_dict = {
             'epoch': epoch,
-            'test/loss_g': sum([l.item() for l in losses_g.values()]),
-            'test/loss_disc': loss_disc.item(),
+            'test/loss_g': avg_loss_g,
+            'test/loss_disc': avg_loss_disc,
+            'test/si_snr': avg_si_snr,
         }
-        for k, l in losses_g.items():
-            test_log_dict[f'test/{k}'] = l.item()
         wandb_logger.log(test_log_dict)
-    
-    logger.info(log_msg)
-
-    # save a sample reconstruction (not cropped)
-    input_wav, _ = testloader.dataset.get()
-    input_wav = input_wav.cuda()
-    output = model(input_wav.unsqueeze(0)).squeeze(0)
-    
-    # Audio samples are logged to WandB - no need to save disk files
     
     # Log audio samples to wandb
     if wandb_logger:
         try:
-            # Ensure audio tensors are properly formatted for wandb
-            input_audio = input_wav.cpu().squeeze()  # Remove batch and channel dimensions if present
-            output_audio = output.cpu().squeeze()    # Remove batch and channel dimensions if present
+            # Get a sample for audio logging
+            input_wav, _ = testloader.dataset.get()
+            input_wav = input_wav.cuda()
+            output = model(input_wav.unsqueeze(0)).squeeze(0)
             
-            # Ensure audio is 1D for wandb
+            input_audio = input_wav.cpu().squeeze()
+            output_audio = output.cpu().squeeze()
+            
             if input_audio.dim() > 1:
                 input_audio = input_audio.squeeze()
             if output_audio.dim() > 1:
@@ -240,7 +309,28 @@ def train(config):
 
     # set train dataset
     trainset = data.MultiChannelAudioDataset(config=config, mode='train')
+    
+    # Create test and validation datasets
     testset = data.MultiChannelAudioDataset(config=config, mode='test')
+    valset = data.MultiChannelAudioDataset(config=config, mode='val')
+    
+    testloader = torch.utils.data.DataLoader(
+        testset,
+        batch_size=config.datasets.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=config.datasets.num_workers,
+        pin_memory=config.datasets.pin_memory
+    )
+    
+    valloader = torch.utils.data.DataLoader(
+        valset,
+        batch_size=config.datasets.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=config.datasets.num_workers,
+        pin_memory=config.datasets.pin_memory
+    )
     
     # set encodec model and discriminator model
     model = EncodecModel._get_model(
@@ -322,16 +412,9 @@ def train(config):
         num_workers=config.datasets.num_workers,
         pin_memory=config.datasets.pin_memory)
     
-    testloader = torch.utils.data.DataLoader(
-        testset,
-        batch_size=config.datasets.batch_size,
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=config.datasets.num_workers,
-        pin_memory=config.datasets.pin_memory)
-    
-    logger.info(f"There are {len(trainloader)} data to train the EnCodec")
-    logger.info(f"There are {len(testloader)} data to test the EnCodec")
+    logger.info(f"Training: {len(trainloader)} batches (batch_size={config.datasets.batch_size})")
+    logger.info(f"Testing: {len(testloader)} batches")
+    logger.info(f"Validation: {len(valloader)} batches")
 
     # set optimizer and scheduler, warmup scheduler
     params = [p for p in model.parameters() if p.requires_grad]
@@ -344,12 +427,32 @@ def train(config):
     scaler = GradScaler() if config.common.amp else None
     scaler_disc = GradScaler() if config.common.amp else None  
 
-    if config.checkpoint.resume and 'scheduler_state_dict' in model_checkpoint.keys() and 'scheduler_state_dict' in disc_model_checkpoint.keys(): 
-        optimizer.load_state_dict(model_checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(model_checkpoint['scheduler_state_dict'])
-        optimizer_disc.load_state_dict(disc_model_checkpoint['optimizer_state_dict'])
-        disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
-        logger.info(f"load optimizer and disc_optimizer state_dict from {resume_epoch}")
+    if config.checkpoint.resume:
+        # Load optimizer states (always try to load)
+        if 'optimizer_state_dict' in model_checkpoint.keys():
+            optimizer.load_state_dict(model_checkpoint['optimizer_state_dict'])
+            logger.info(f"✓ Loaded generator optimizer state from epoch {resume_epoch}")
+        else:
+            logger.warning("Generator optimizer state not found in checkpoint")
+            
+        if 'optimizer_state_dict' in disc_model_checkpoint.keys():
+            optimizer_disc.load_state_dict(disc_model_checkpoint['optimizer_state_dict'])
+            logger.info(f"✓ Loaded discriminator optimizer state from epoch {resume_epoch}")
+        else:
+            logger.warning("Discriminator optimizer state not found in checkpoint")
+        
+        # Load scheduler states (always try to load)
+        if 'scheduler_state_dict' in model_checkpoint.keys():
+            scheduler.load_state_dict(model_checkpoint['scheduler_state_dict'])
+            logger.info(f"✓ Loaded generator scheduler state from epoch {resume_epoch}")
+        else:
+            logger.warning("Generator scheduler state not found in checkpoint")
+            
+        if 'scheduler_state_dict' in disc_model_checkpoint.keys():
+            disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
+            logger.info(f"✓ Loaded discriminator scheduler state from epoch {resume_epoch}")
+        else:
+            logger.warning("Discriminator scheduler state not found in checkpoint")
 
     
     start_epoch = max(1, resume_epoch+1) # start epoch is 1 if not resume
@@ -358,15 +461,18 @@ def train(config):
     if balancer:
         logger.info(f'Loss balancer with weights {balancer.weights} instantiated')
     
-    test(0, model, disc_model, testloader, config, wandb_logger)
-    
     for epoch in range(start_epoch, config.common.max_epoch+1):
         train_one_step(
             epoch, optimizer, optimizer_disc, 
             model, disc_model, trainloader, config,
             scheduler, disc_scheduler, scaler, scaler_disc, balancer, wandb_logger)
         
-        if epoch % config.common.test_interval == 0:
+        # Validation every 5 epochs (starting from epoch 5)
+        if epoch % config.common.val_interval == 0 and epoch > 0:
+            validate(epoch, model, disc_model, valloader, config, wandb_logger)
+        
+        # Testing every 10 epochs (starting from epoch 10)
+        if epoch % config.common.test_interval == 0 and epoch > 0:
             test(epoch, model, disc_model, testloader, config, wandb_logger)
         
         # save checkpoint and epoch

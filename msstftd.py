@@ -116,9 +116,13 @@ class MultiScaleSTFTDiscriminator(nn.Module):
         win_lengths (Sequence[int]): Window size for each scale
         **kwargs: additional args for STFTDiscriminator
     """
-    def __init__(self, filters: int, in_channels: int = 1, out_channels: int = 1,
-                 n_ffts: tp.List[int] = [1024, 2048, 512], hop_lengths: tp.List[int] = [256, 512, 128],
-                 win_lengths: tp.List[int] = [1024, 2048, 512], **kwargs):
+    def __init__(self, filters: int = 32, in_channels: int = 1, out_channels: int = 1, 
+                 sep_channels: bool = False,
+                 n_ffts: tp.List[int] = [2048, 1024, 512, 256, 128], 
+                 hop_lengths: tp.List[int] = [512, 256, 128, 64, 32],
+                 win_lengths: tp.List[int] = [2048, 1024, 512, 256, 128], 
+                 sequential: bool = True,
+                 **kwargs):
         super().__init__()
         assert len(n_ffts) == len(hop_lengths) == len(win_lengths)
         self.discriminators = nn.ModuleList([
