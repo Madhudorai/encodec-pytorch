@@ -1,0 +1,78 @@
+common:
+  save_interval: 1
+  test_interval: 10
+  val_interval: 10
+  log_interval: 100
+  max_epoch: 300
+  seed: 3401
+  amp: False
+
+datasets:
+  # Multi-dataset configuration
+  jamendo_train_csv: '/scratch/iran/jamendo/jamendo_train.csv'
+  jamendo_valid_csv: '/scratch/iran/jamendo/jamendo_val.csv'
+  jamendo_test_csv: '/scratch/iran/jamendo/jamendo_test.csv'
+  
+  common_voice_train_csv: '/scratch/iran/common_voice/common_voice_train.csv'
+  common_voice_valid_csv: '/scratch/iran/common_voice/common_voice_val.csv'
+  common_voice_test_csv: '/scratch/iran/common_voice/common_voice_test.csv'
+  
+  fsd50k_train_csv: '/scratch/iran/fsd50k/fsd50k_train.csv'
+  fsd50k_valid_csv: '/scratch/iran/fsd50k/fsd50k_val.csv'
+  fsd50k_test_csv: '/scratch/iran/fsd50k/fsd50k_test.csv'
+  
+  batch_size: 16
+  tensor_cut: 24000  # 1 second at 24kHz
+  num_workers: 4
+  fixed_length: 32000  # 2k updates per epoch (2000 * 16 batch_size)
+  pin_memory: False  # Disable to save memory
+
+checkpoint:
+  resume: False
+  checkpoint_path: ''
+  disc_checkpoint_path: ''
+  save_folder: './checkpoints_multi_dataset/'
+  save_location: '${checkpoint.save_folder}/bs${datasets.batch_size}_cut${datasets.tensor_cut}_length${datasets.fixed_length}_' 
+
+optimization:
+  lr: 3e-4
+  disc_lr: 3e-4
+
+lr_scheduler:
+  warmup_epoch: 5
+
+model:
+  target_bandwidths: [1.5, 3., 6., 12., 24.]
+  sample_rate: 24_000
+  channels: 1
+  train_discriminator: True
+  audio_normalize: True
+  filters: 32
+  ratios: [8, 5, 4, 2]
+  disc_win_lengths: [2048, 1024, 512, 256, 128]
+  disc_hop_lengths: [512, 256, 128, 64, 32]
+  disc_n_ffts: [2048, 1024, 512, 256, 128]
+  causal: True
+  norm: 'weight_norm'
+  segment: None
+  name: 'multi_dataset_encodec'
+
+distributed:
+  data_parallel: True
+  world_size: 1
+  find_unused_parameters: False
+  torch_distributed_debug: False
+  init_method: tcp
+
+balancer:
+  weights:
+    l_t: 0.1
+    l_f: 1
+    l_g: 3
+    l_feat: 3
+
+# Weights & Biases configuration
+wandb:
+  enabled: True
+  project: 'multi-dataset-encodec'
+  name: 'multi_dataset_bs64_epochs300_24khz_mono'

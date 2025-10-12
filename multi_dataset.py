@@ -1,0 +1,231 @@
+import os
+import random
+import pandas as pd
+import torch
+import librosa
+import audioread
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
+
+from utils import convert_audio
+
+
+class MultiDataset(torch.utils.data.Dataset):
+    """Multi-dataset class that can handle multiple CSV files for training, validation, and testing."""
+    
+    def __init__(self, config, transform=None, mode='train'):
+        assert mode in ['train', 'val', 'test'], 'dataset mode must be train, val, or test'
+        
+        self.config = config
+        self.transform = transform
+        self.mode = mode
+        self.fixed_length = config.datasets.fixed_length
+        self.tensor_cut = config.datasets.tensor_cut
+        self.sample_rate = config.model.sample_rate
+        self.channels = config.model.channels
+        
+        # Load datasets based on mode
+        self.audio_files = self._load_datasets()
+        
+        logger.info(f"Loaded {len(self.audio_files)} audio files for {mode} mode")
+        
+        # Log dataset composition
+        dataset_counts = {}
+        for file_path in self.audio_files:
+            dataset_name = self._get_dataset_name(file_path)
+            dataset_counts[dataset_name] = dataset_counts.get(dataset_name, 0) + 1
+        
+        logger.info(f"Dataset composition for {mode}:")
+        for dataset_name, count in dataset_counts.items():
+            logger.info(f"  {dataset_name}: {count} files")
+        
+        # For validation and test, create fixed segments for consistent evaluation
+        if mode in ['val', 'test']:
+            self.fixed_segments = self._create_fixed_segments()
+
+    def _load_datasets(self):
+        """Load audio files from multiple datasets based on mode."""
+        audio_files = []
+        
+        # Define dataset configurations
+        datasets_config = {
+            'jamendo': {
+                'train': self.config.datasets.jamendo_train_csv,
+                'val': self.config.datasets.jamendo_valid_csv,
+                'test': self.config.datasets.jamendo_test_csv
+            },
+            'common_voice': {
+                'train': self.config.datasets.common_voice_train_csv,
+                'val': self.config.datasets.common_voice_valid_csv,
+                'test': self.config.datasets.common_voice_test_csv
+            }
+        }
+        
+        # Add more datasets as needed
+        # datasets_config['librispeech'] = {
+        #     'train': self.config.datasets.librispeech_train_csv,
+        #     'val': self.config.datasets.librispeech_valid_csv,
+        #     'test': self.config.datasets.librispeech_test_csv
+        # }
+        
+        # Load files from each dataset
+        for dataset_name, csv_paths in datasets_config.items():
+            csv_path = csv_paths[self.mode]
+            
+            if csv_path and os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path, on_bad_lines='skip')
+                    if len(df) > 0:
+                        # Assume the first column contains the audio file paths
+                        dataset_files = df.iloc[:, 0].tolist()
+                        audio_files.extend(dataset_files)
+                        logger.info(f"Loaded {len(dataset_files)} files from {dataset_name} {self.mode}")
+                    else:
+                        logger.warning(f"Empty CSV file: {csv_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load {dataset_name} {self.mode}: {e}")
+            else:
+                logger.warning(f"CSV file not found: {csv_path}")
+        
+        if len(audio_files) == 0:
+            raise ValueError(f"No audio files found for {self.mode} mode")
+        
+        return audio_files
+
+    def _create_fixed_segments(self):
+        """Create fixed segments for consistent validation/testing."""
+        import random
+        import soundfile as sf
+        
+        fixed_segments = []
+        random.seed(42)  # Fixed seed for reproducible evaluation
+        
+        # Create fixed segments from all available audio files
+        for i in range(min(1000, len(self.audio_files) * 10)):  # Up to 1000 segments
+            audio_path = self.audio_files[i % len(self.audio_files)]
+            
+            try:
+                # Get file info
+                info = sf.info(audio_path)
+                file_duration = info.frames / info.samplerate
+                
+                # Random but fixed start time
+                max_start_time = max(0, file_duration - 1.0)  # Leave 1 second at end
+                start_time = random.uniform(0, max_start_time)
+                
+                fixed_segments.append({
+                    'audio_path': audio_path,
+                    'start_time': start_time,
+                    'sample_rate': info.samplerate
+                })
+            except Exception as e:
+                logger.warning(f"Failed to get info for {audio_path}: {e}")
+                continue
+        
+        random.seed()  # Reset to random seed
+        logger.info(f"Created {len(fixed_segments)} fixed segments for {self.mode}")
+        return fixed_segments
+
+    def _get_dataset_name(self, file_path):
+        """Extract dataset name from file path."""
+        if 'jamendo' in file_path.lower():
+            return 'jamendo'
+        elif 'common_voice' in file_path.lower() or 'commonvoice' in file_path.lower():
+            return 'common_voice'
+        elif 'librispeech' in file_path.lower():
+            return 'librispeech'
+        else:
+            return 'unknown'
+
+    def __len__(self):
+        if self.mode in ['val', 'test'] and hasattr(self, 'fixed_segments'):
+            return len(self.fixed_segments)
+        return self.fixed_length if self.fixed_length and len(self.audio_files) > self.fixed_length else len(self.audio_files)
+
+    def get(self, idx=None):
+        """Get uncropped, untransformed audio with random sample feature."""
+        if idx is not None and idx >= len(self):
+            raise StopIteration
+        if idx is None:
+            idx = random.randrange(len(self))
+        
+        try:
+            # For validation and test, use fixed segments
+            if self.mode in ['val', 'test'] and hasattr(self, 'fixed_segments'):
+                segment = self.fixed_segments[idx % len(self.fixed_segments)]
+                audio_path = segment['audio_path']
+                start_time = segment['start_time']
+                sample_rate = segment['sample_rate']
+                
+                # Load specific segment
+                waveform, sample_rate = librosa.load(
+                    audio_path,
+                    sr=self.sample_rate,
+                    mono=self.channels == 1,
+                    offset=start_time,
+                    duration=1.0  # 1 second
+                )
+            else:
+                # For training, use random selection
+                audio_path = self.audio_files[idx % len(self.audio_files)]
+                logger.debug(f'Loading {audio_path}')
+                
+                waveform, sample_rate = librosa.load(
+                    audio_path, 
+                    sr=self.sample_rate,
+                    mono=self.channels == 1
+                )
+        except (audioread.exceptions.NoBackendError, ZeroDivisionError, FileNotFoundError) as e:
+            logger.warning(f"Not able to load {audio_path}: {e}")
+            # Return a random sample instead
+            return self[random.randint(0, len(self) - 1)]
+
+        # Add channel dimension if loaded audio was mono
+        waveform = torch.as_tensor(waveform)
+        if len(waveform.shape) == 1:
+            waveform = waveform.unsqueeze(0)
+            waveform = waveform.expand(self.channels, -1)
+
+        return waveform, sample_rate
+
+    def __getitem__(self, idx):
+        waveform, sample_rate = self.get(idx)
+
+        if self.transform:
+            waveform = self.transform(waveform)
+
+        if self.tensor_cut > 0:
+            if waveform.size()[1] > self.tensor_cut:
+                start = random.randint(0, waveform.size()[1] - self.tensor_cut - 1)
+                waveform = waveform[:, start:start + self.tensor_cut]
+                return waveform, sample_rate
+            else:
+                # If audio is shorter than tensor_cut, pad with zeros
+                if waveform.size()[1] < self.tensor_cut:
+                    padding_size = self.tensor_cut - waveform.size()[1]
+                    padding = torch.zeros(waveform.size()[0], padding_size)
+                    waveform = torch.cat([waveform, padding], dim=1)
+                return waveform, sample_rate
+
+        return waveform, sample_rate
+
+
+def pad_sequence(batch):
+    """Make all tensors in a batch the same length by padding with zeros."""
+    batch = [item.permute(1, 0) for item in batch]
+    batch = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0.)
+    batch = batch.permute(0, 2, 1)
+    return batch
+
+
+def collate_fn(batch):
+    """Collate function for the dataloader."""
+    tensors = []
+    for waveform, _ in batch:
+        tensors += [waveform]
+    
+    # Group the list of tensors into a batched tensor
+    tensors = pad_sequence(tensors)
+    return tensors

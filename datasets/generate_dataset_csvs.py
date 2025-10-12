@@ -34,7 +34,7 @@ def split_train_test_csv(csv_path, threshold=0.8):
     train_data.to_csv(output_dir / f'{base_name}_train.csv', index=False, header=False)  
     test_data.to_csv(output_dir / f'{base_name}_test.csv', index=False, header=False)
 
-def split_train_val_test_csv(csv_path, train_ratio=0.995, val_ratio=0.0025, test_ratio=0.0025):
+def split_train_val_test_csv(csv_path, input_dir, train_ratio=0.995, val_ratio=0.0025, test_ratio=0.0025):
     """Split CSV into train/val/test with custom ratios"""
     try:
         from sklearn.model_selection import train_test_split  
@@ -57,10 +57,8 @@ def split_train_val_test_csv(csv_path, train_ratio=0.995, val_ratio=0.0025, test
     val_size = val_ratio / (val_ratio + test_ratio)  # Proportion of val in the remaining data
     val_data, test_data = train_test_split(temp_data, train_size=val_size, random_state=42)
     
-    # Save files in the same directory as the output path
-    csv_path_obj = Path(csv_path)
-    base_name = csv_path_obj.stem
-    output_dir = csv_path_obj.parent
+    base_name = Path(input_dir).name
+    output_dir = Path(input_dir)
     
     # Save files (only save train file if it has data)
     if len(train_data) > 0:
@@ -74,6 +72,7 @@ def split_train_val_test_csv(csv_path, train_ratio=0.995, val_ratio=0.0025, test
     print(f"  Test: {len(test_data)} files ({len(test_data)/len(data)*100:.3f}%)")
     
     # Clean up intermediate CSV file
+    csv_path_obj = Path(csv_path)
     if csv_path_obj.exists():
         csv_path_obj.unlink()
         print(f"✓ Cleaned up intermediate file: {csv_path}") 
@@ -81,7 +80,6 @@ def split_train_val_test_csv(csv_path, train_ratio=0.995, val_ratio=0.0025, test
 if __name__ == '__main__':
     arg = argparse.ArgumentParser()
     arg.add_argument('-i','--input_file_dir', type=str, default='./LibriSpeech/train-clean-100')
-    arg.add_argument('-o','--output_path', type=str, default='./librispeech_train100h.csv')
     arg.add_argument('-s','--split', action='store_true', default=False,help='split dataset')
     arg.add_argument('-t','--threshold',type=float,default=0.8)
     arg.add_argument('--three_way_split', action='store_true', default=False,help='split into train/val/test with custom ratios')
@@ -89,8 +87,13 @@ if __name__ == '__main__':
     arg.add_argument('--val_ratio',type=float,default=0.0025,help='validation ratio for three-way split')
     arg.add_argument('--test_ratio',type=float,default=0.0025,help='test ratio for three-way split')
     args = arg.parse_args()
-    generate_csv(args.input_file_dir, args.output_path)
+    
+    # Generate temporary CSV file name based on input directory
+    input_dir_name = Path(args.input_file_dir).name
+    temp_csv_path = f'/tmp/{input_dir_name}_temp.csv'
+    
+    generate_csv(args.input_file_dir, temp_csv_path)
     if args.three_way_split:
-        split_train_val_test_csv(args.output_path, args.train_ratio, args.val_ratio, args.test_ratio)
+        split_train_val_test_csv(temp_csv_path, args.input_file_dir, args.train_ratio, args.val_ratio, args.test_ratio)
     elif args.split:
-        split_train_test_csv(args.output_path,threshold=args.threshold)
+        split_train_test_csv(temp_csv_path,threshold=args.threshold)
