@@ -144,10 +144,12 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
     total_loss_g = 0.0
     total_loss_disc = 0.0
     total_si_snr = 0.0
+    total_pesq_nb = 0.0
+    total_pesq_wb = 0.0
     num_samples = 0
     
     # Track metrics per bandwidth
-    bandwidth_metrics = defaultdict(lambda: {'si_snr': 0.0, 'count': 0})
+    bandwidth_metrics = defaultdict(lambda: {'si_snr': 0.0, 'pesq_nb': 0.0, 'pesq_wb': 0.0, 'count': 0})
     
     for idx, input_wav in enumerate(valloader):
         if torch.cuda.is_available():
@@ -166,28 +168,51 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             total_loss_g += sum([l.item() for l in losses_g.values()])
             total_loss_disc += loss_disc.item()
             
-            # Calculate SI-SNR for each sample in batch
+            # Calculate comprehensive metrics for each sample in batch
             batch_size = input_wav.shape[0]
             for i in range(batch_size):
                 ref_sample = input_wav[i].squeeze().cpu()
                 rec_sample = output[i].squeeze().cpu()
-                si_snr_val = calculate_si_snr(ref_sample, rec_sample)
-                total_si_snr += si_snr_val
-                bandwidth_metrics[bandwidth]['si_snr'] += si_snr_val
+                
+                # Calculate all metrics
+                metrics = calculate_all_metrics(
+                    ref_sample.numpy(), 
+                    rec_sample.numpy(), 
+                    sr=config.model.sample_rate, 
+                    mode='audio'
+                )
+                
+                # Update totals
+                if metrics['si_snr'] is not None:
+                    total_si_snr += metrics['si_snr']
+                    bandwidth_metrics[bandwidth]['si_snr'] += metrics['si_snr']
+                
+                if metrics['pesq_nb'] is not None:
+                    total_pesq_nb += metrics['pesq_nb']
+                    bandwidth_metrics[bandwidth]['pesq_nb'] += metrics['pesq_nb']
+                
+                if metrics['pesq_wb'] is not None:
+                    total_pesq_wb += metrics['pesq_wb']
+                    bandwidth_metrics[bandwidth]['pesq_wb'] += metrics['pesq_wb']
+                
                 bandwidth_metrics[bandwidth]['count'] += 1
                 num_samples += 1
     
     avg_loss_g = total_loss_g / (len(valloader) * len(config.model.target_bandwidths))
     avg_loss_disc = total_loss_disc / (len(valloader) * len(config.model.target_bandwidths))
     avg_si_snr = total_si_snr / num_samples
+    avg_pesq_nb = total_pesq_nb / num_samples if num_samples > 0 else 0.0
+    avg_pesq_wb = total_pesq_wb / num_samples if num_samples > 0 else 0.0
     
-    log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB"
+    log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB | PESQ-NB: {avg_pesq_nb:.3f} | PESQ-WB: {avg_pesq_wb:.3f}"
     logger.info(log_msg)
     
     # Log bandwidth-specific metrics
     for bandwidth, metrics in bandwidth_metrics.items():
         avg_bandwidth_si_snr = metrics['si_snr'] / metrics['count']
-        logger.info(f"  Bandwidth {bandwidth} kbps: SI-SNR = {avg_bandwidth_si_snr:.2f} dB")
+        avg_bandwidth_pesq_nb = metrics['pesq_nb'] / metrics['count']
+        avg_bandwidth_pesq_wb = metrics['pesq_wb'] / metrics['count']
+        logger.info(f"  Bandwidth {bandwidth} kbps: SI-SNR = {avg_bandwidth_si_snr:.2f} dB | PESQ-NB = {avg_bandwidth_pesq_nb:.3f} | PESQ-WB = {avg_bandwidth_pesq_wb:.3f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -196,12 +221,18 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             'val/loss_g': avg_loss_g,
             'val/loss_disc': avg_loss_disc,
             'val/si_snr': avg_si_snr,
+            'val/pesq_nb': avg_pesq_nb,
+            'val/pesq_wb': avg_pesq_wb,
         }
         
         # Log bandwidth-specific metrics
         for bandwidth, metrics in bandwidth_metrics.items():
             avg_bandwidth_si_snr = metrics['si_snr'] / metrics['count']
+            avg_bandwidth_pesq_nb = metrics['pesq_nb'] / metrics['count']
+            avg_bandwidth_pesq_wb = metrics['pesq_wb'] / metrics['count']
             val_log_dict[f'val/si_snr_bw_{bandwidth}'] = avg_bandwidth_si_snr
+            val_log_dict[f'val/pesq_nb_bw_{bandwidth}'] = avg_bandwidth_pesq_nb
+            val_log_dict[f'val/pesq_wb_bw_{bandwidth}'] = avg_bandwidth_pesq_wb
         
         wandb_logger.log(val_log_dict)
 
