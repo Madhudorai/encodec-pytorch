@@ -6,6 +6,7 @@ import librosa
 import audioread
 from pathlib import Path
 import logging
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +30,14 @@ class MultiDataset(torch.utils.data.Dataset):
         # Load datasets based on mode
         self.audio_files = self._load_datasets()
         
+        # Separate files by dataset for mixing strategies
+        self.dataset_files = self._organize_files_by_dataset()
+        
         logger.info(f"Loaded {len(self.audio_files)} audio files for {mode} mode")
         
         # Log dataset composition
-        dataset_counts = {}
-        for file_path in self.audio_files:
-            dataset_name = self._get_dataset_name(file_path)
-            dataset_counts[dataset_name] = dataset_counts.get(dataset_name, 0) + 1
-        
-        logger.info(f"Dataset composition for {mode}:")
-        for dataset_name, count in dataset_counts.items():
-            logger.info(f"  {dataset_name}: {count} files")
+        for dataset_name, files in self.dataset_files.items():
+            logger.info(f"  {dataset_name}: {len(files)} files")
         
         # For validation and test, create fixed segments for consistent evaluation
         if mode in ['val', 'test']:
@@ -104,6 +102,22 @@ class MultiDataset(torch.utils.data.Dataset):
         
         return audio_files
 
+    def _organize_files_by_dataset(self):
+        """Organize audio files by dataset for mixing strategies."""
+        dataset_files = {
+            'jamendo': [],
+            'common_voice': [],
+            'fsd50k': [],
+            'dns_challenge4': []
+        }
+        
+        for file_path in self.audio_files:
+            dataset_name = self._get_dataset_name(file_path)
+            if dataset_name in dataset_files:
+                dataset_files[dataset_name].append(file_path)
+        
+        return dataset_files
+
     def _create_fixed_segments(self):
         """Create segments for validation/testing."""
         import random
@@ -161,21 +175,170 @@ class MultiDataset(torch.utils.data.Dataset):
         else:
             return 'unknown'
 
+    def _load_audio_segment(self, audio_path, duration=1.0):
+        """Load a random 1-second segment from an audio file."""
+        try:
+            # Get file info to determine duration
+            import soundfile as sf
+            info = sf.info(audio_path)
+            file_duration = info.frames / info.samplerate
+            
+            # Random start time
+            max_start_time = max(0, file_duration - duration)
+            start_time = random.uniform(0, max_start_time)
+            
+            # Load the segment
+            waveform, sample_rate = librosa.load(
+                audio_path,
+                sr=self.sample_rate,
+                mono=self.channels == 1,
+                offset=start_time,
+                duration=duration
+            )
+            
+            # Convert to tensor and add channel dimension if needed
+            waveform = torch.as_tensor(waveform)
+            if len(waveform.shape) == 1:
+                waveform = waveform.unsqueeze(0)
+                waveform = waveform.expand(self.channels, -1)
+            
+            # Ensure exact length to avoid tensor size mismatches
+            target_length = int(self.sample_rate * duration)
+            if waveform.shape[1] > target_length:
+                waveform = waveform[:, :target_length]
+            elif waveform.shape[1] < target_length:
+                padding = torch.zeros(self.channels, target_length - waveform.shape[1])
+                waveform = torch.cat([waveform, padding], dim=1)
+            
+            return waveform
+            
+        except Exception as e:
+            logger.warning(f"Failed to load segment from {audio_path}: {e}")
+            # Return silence if loading fails
+            return torch.zeros(self.channels, int(self.sample_rate * duration))
+
+    def _normalize_audio(self, waveform):
+        """Normalize audio by file (per-file normalization)."""
+        # Calculate RMS and normalize
+        rms = torch.sqrt(torch.mean(waveform ** 2))
+        if rms > 0:
+            waveform = waveform / rms
+        return waveform
+
+    def _apply_random_gain(self, waveform, min_gain_db=-10, max_gain_db=6):
+        """Apply random gain between min_gain_db and max_gain_db."""
+        gain_db = random.uniform(min_gain_db, max_gain_db)
+        gain_linear = 10 ** (gain_db / 20)
+        return waveform * gain_linear
+
+    def _sample_mixing_strategy(self):
+        """Sample one of the four mixing strategies based on probabilities."""
+        rand = random.random()
+        
+        if rand < 0.32:
+            return 's1'  # Single source from Jamendo (0.32)
+        elif rand < 0.64:  # 0.32 + 0.32
+            return 's2'  # Single source from other datasets (0.32)
+        elif rand < 0.88:  # 0.64 + 0.24
+            return 's3'  # Mix two sources (0.24)
+        else:  # 0.88 to 1.0
+            return 's4'  # Mix three sources (0.12)
+
+    def _get_mixed_audio(self):
+        """Get audio sample based on mixing strategy."""
+        strategy = self._sample_mixing_strategy()
+        
+        if strategy == 's1':
+            # Single source from Jamendo (probability 0.32)
+            if len(self.dataset_files['jamendo']) > 0:
+                audio_path = random.choice(self.dataset_files['jamendo'])
+                waveform = self._load_audio_segment(audio_path)
+            else:
+                # Fallback to any available dataset
+                all_files = [f for files in self.dataset_files.values() for f in files]
+                audio_path = random.choice(all_files)
+                waveform = self._load_audio_segment(audio_path)
+        
+        elif strategy == 's2':
+            # Single source from other datasets (probability 0.10 each)
+            other_datasets = ['common_voice', 'fsd50k', 'dns_challenge4']
+            available_datasets = [d for d in other_datasets if len(self.dataset_files[d]) > 0]
+            
+            if available_datasets:
+                dataset = random.choice(available_datasets)
+                audio_path = random.choice(self.dataset_files[dataset])
+                waveform = self._load_audio_segment(audio_path)
+            else:
+                # Fallback to any available dataset
+                all_files = [f for files in self.dataset_files.values() for f in files]
+                audio_path = random.choice(all_files)
+                waveform = self._load_audio_segment(audio_path)
+        
+        elif strategy == 's3':
+            # Mix two sources from all datasets (probability 0.24)
+            all_files = [f for files in self.dataset_files.values() for f in files]
+            if len(all_files) >= 2:
+                # Sample two different files
+                audio_paths = random.sample(all_files, 2)
+                waveform1 = self._load_audio_segment(audio_paths[0])
+                waveform2 = self._load_audio_segment(audio_paths[1])
+                waveform = waveform1 + waveform2
+            else:
+                # Fallback to single source
+                audio_path = random.choice(all_files)
+                waveform = self._load_audio_segment(audio_path)
+        
+        elif strategy == 's4':
+            # Mix three sources from all datasets except music (probability 0.12)
+            non_music_files = []
+            for dataset in ['common_voice', 'fsd50k', 'dns_challenge4']:
+                non_music_files.extend(self.dataset_files[dataset])
+            
+            if len(non_music_files) >= 3:
+                # Sample three different files
+                audio_paths = random.sample(non_music_files, 3)
+                waveform1 = self._load_audio_segment(audio_paths[0])
+                waveform2 = self._load_audio_segment(audio_paths[1])
+                waveform3 = self._load_audio_segment(audio_paths[2])
+                waveform = waveform1 + waveform2 + waveform3
+            elif len(non_music_files) >= 2:
+                # Fallback to two sources
+                audio_paths = random.sample(non_music_files, 2)
+                waveform1 = self._load_audio_segment(audio_paths[0])
+                waveform2 = self._load_audio_segment(audio_paths[1])
+                waveform = waveform1 + waveform2
+            else:
+                # Fallback to single source
+                all_files = [f for files in self.dataset_files.values() for f in files]
+                audio_path = random.choice(all_files)
+                waveform = self._load_audio_segment(audio_path)
+        
+        # Apply normalization and random gain
+        waveform = self._normalize_audio(waveform)
+        waveform = self._apply_random_gain(waveform)
+        
+        return waveform
+
     def __len__(self):
         if self.mode in ['val', 'test'] and hasattr(self, 'fixed_segments'):
             return len(self.fixed_segments)
         return self.fixed_length if self.fixed_length and len(self.audio_files) > self.fixed_length else len(self.audio_files)
 
     def get(self, idx=None):
-        """Get uncropped, untransformed audio with random sample feature."""
+        """Get uncropped, untransformed audio with mixing strategy for training and validation."""
         if idx is not None and idx >= len(self):
             raise StopIteration
         if idx is None:
             idx = random.randrange(len(self))
         
         try:
-            # For validation and test, use fixed segments
-            if self.mode in ['val', 'test'] and hasattr(self, 'fixed_segments'):
+            # For validation, use mixing strategy
+            if self.mode == 'val':
+                # Use mixing strategy for validation
+                waveform = self._get_mixed_audio()
+                sample_rate = self.sample_rate
+            # For test, use fixed segments (no mixing)
+            elif self.mode == 'test' and hasattr(self, 'fixed_segments'):
                 segment = self.fixed_segments[idx % len(self.fixed_segments)]
                 audio_path = segment['audio_path']
                 start_time = segment['start_time']
@@ -189,26 +352,21 @@ class MultiDataset(torch.utils.data.Dataset):
                     offset=start_time,
                     duration=1.0  # 1 second
                 )
-            else:
-                # For training, use systematic file selection
-                audio_path = self.audio_files[idx % len(self.audio_files)]
-                logger.debug(f'Loading {audio_path}')
                 
-                waveform, sample_rate = librosa.load(
-                    audio_path, 
-                    sr=self.sample_rate,
-                    mono=self.channels == 1
-                )
+                # Add channel dimension if loaded audio was mono
+                waveform = torch.as_tensor(waveform)
+                if len(waveform.shape) == 1:
+                    waveform = waveform.unsqueeze(0)
+                    waveform = waveform.expand(self.channels, -1)
+            else:
+                # For training, use mixing strategy
+                waveform = self._get_mixed_audio()
+                sample_rate = self.sample_rate
+                
         except (audioread.exceptions.NoBackendError, ZeroDivisionError, FileNotFoundError) as e:
-            logger.warning(f"Not able to load {audio_path}: {e}")
+            logger.warning(f"Not able to load audio: {e}")
             # Return a random sample instead
             return self[random.randint(0, len(self) - 1)]
-
-        # Add channel dimension if loaded audio was mono
-        waveform = torch.as_tensor(waveform)
-        if len(waveform.shape) == 1:
-            waveform = waveform.unsqueeze(0)
-            waveform = waveform.expand(self.channels, -1)
 
         return waveform, sample_rate
 
