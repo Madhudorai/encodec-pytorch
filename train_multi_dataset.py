@@ -387,8 +387,8 @@ def train(config):
         model.cuda()
         disc_model.cuda()
 
-    logger.info(f"Training: {len(trainloader)} batches (batch_size={config.datasets.batch_size})")
-    logger.info(f"Validation: 10k segments per epoch with systematic file coverage (batch_size={config.datasets.batch_size})")
+    logger.info(f"Training: {len(trainloader)} batches with mixing strategy (batch_size={config.datasets.batch_size})")
+    logger.info(f"Validation: 10k mixed segments per epoch with mixing strategy (batch_size={config.datasets.batch_size})")
 
     # Set up optimizers and schedulers
     params = [p for p in model.parameters() if p.requires_grad]
@@ -449,7 +449,7 @@ def train(config):
         
         # Validation
         if epoch % config.common.val_interval == 0 and epoch > 0:
-            # Create fresh validation dataset with random segments for this epoch
+            # Create fresh validation dataset with mixed audio segments for this epoch
             valset = data.MultiDataset(config=config, mode='val')
             valloader = torch.utils.data.DataLoader(
                 valset,
