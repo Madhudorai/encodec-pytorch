@@ -1,6 +1,5 @@
 common:
   save_interval: 1
-  test_interval: 10
   val_interval: 1
   log_interval: 100
   max_epoch: 300
@@ -20,6 +19,10 @@ datasets:
   fsd50k_train_csv: '/scratch/iran/fsd50k/fsd50k_train.csv'
   fsd50k_valid_csv: '/scratch/iran/fsd50k/fsd50k_val.csv'
   fsd50k_test_csv: '/scratch/iran/fsd50k/fsd50k_test.csv'
+
+  dns_challenge4_train_csv: '/scratch/iran/dns_challenge4/dns_challenge4_train.csv'
+  dns_challenge4_valid_csv: '/scratch/iran/dns_challenge4/dns_challenge4_val.csv'
+  dns_challenge4_test_csv: '/scratch/iran/dns_challenge4/dns_challenge4_test.csv'
   
   batch_size: 16
   tensor_cut: 24000  # 1 second at 24kHz

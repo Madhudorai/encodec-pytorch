@@ -60,6 +60,16 @@ class MultiDataset(torch.utils.data.Dataset):
                 'train': self.config.datasets.common_voice_train_csv,
                 'val': self.config.datasets.common_voice_valid_csv,
                 'test': self.config.datasets.common_voice_test_csv
+            },
+            'fsd50k': {
+                'train': self.config.datasets.fsd50k_train_csv,
+                'val': self.config.datasets.fsd50k_valid_csv,
+                'test': self.config.datasets.fsd50k_test_csv
+            },
+            'dns_challenge4': {
+                'train': self.config.datasets.dns_challenge4_train_csv,
+                'val': self.config.datasets.dns_challenge4_valid_csv,
+                'test': self.config.datasets.dns_challenge4_test_csv
             }
         }
         
@@ -95,15 +105,21 @@ class MultiDataset(torch.utils.data.Dataset):
         return audio_files
 
     def _create_fixed_segments(self):
-        """Create fixed segments for consistent validation/testing."""
+        """Create segments for validation/testing."""
         import random
         import soundfile as sf
         
-        fixed_segments = []
-        random.seed(42)  # Fixed seed for reproducible evaluation
+        segments = []
         
-        # Create fixed segments from all available audio files
-        for i in range(min(1000, len(self.audio_files) * 10)):  # Up to 1000 segments
+        # For validation, create 10k random segments every epoch
+        if self.mode == 'val':
+            num_segments = 10000
+        else:  # test mode
+            num_segments = 1000
+            random.seed(42)  # Fixed seed for reproducible test evaluation
+        
+        # Create segments from all available audio files
+        for i in range(min(num_segments, len(self.audio_files) * 20)):  # Allow more segments per file
             audio_path = self.audio_files[i % len(self.audio_files)]
             
             try:
@@ -111,11 +127,11 @@ class MultiDataset(torch.utils.data.Dataset):
                 info = sf.info(audio_path)
                 file_duration = info.frames / info.samplerate
                 
-                # Random but fixed start time
+                # Random start time
                 max_start_time = max(0, file_duration - 1.0)  # Leave 1 second at end
                 start_time = random.uniform(0, max_start_time)
                 
-                fixed_segments.append({
+                segments.append({
                     'audio_path': audio_path,
                     'start_time': start_time,
                     'sample_rate': info.samplerate
@@ -124,9 +140,11 @@ class MultiDataset(torch.utils.data.Dataset):
                 logger.warning(f"Failed to get info for {audio_path}: {e}")
                 continue
         
-        random.seed()  # Reset to random seed
-        logger.info(f"Created {len(fixed_segments)} fixed segments for {self.mode}")
-        return fixed_segments
+        if self.mode == 'test':
+            random.seed()  # Reset to random seed only for test mode
+        
+        logger.info(f"Created {len(segments)} segments for {self.mode}")
+        return segments
 
     def _get_dataset_name(self, file_path):
         """Extract dataset name from file path."""
@@ -134,6 +152,10 @@ class MultiDataset(torch.utils.data.Dataset):
             return 'jamendo'
         elif 'common_voice' in file_path.lower() or 'commonvoice' in file_path.lower():
             return 'common_voice'
+        elif 'fsd50k' in file_path.lower():
+            return 'fsd50k'
+        elif 'dns_challenge4' in file_path.lower() or 'dns' in file_path.lower():
+            return 'dns_challenge4'
         elif 'librispeech' in file_path.lower():
             return 'librispeech'
         else:
@@ -168,7 +190,7 @@ class MultiDataset(torch.utils.data.Dataset):
                     duration=1.0  # 1 second
                 )
             else:
-                # For training, use random selection
+                # For training, use systematic file selection
                 audio_path = self.audio_files[idx % len(self.audio_files)]
                 logger.debug(f'Loading {audio_path}')
                 

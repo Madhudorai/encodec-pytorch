@@ -4,6 +4,7 @@ import warnings
 from collections import defaultdict
 import random
 from pathlib import Path
+import numpy as np
 
 import hydra
 import torch
@@ -26,6 +27,24 @@ warnings.filterwarnings("ignore")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+
+def calculate_confidence_interval(values, confidence=0.95):
+    """Calculate mean and 95% confidence interval for a list of values."""
+    if len(values) == 0:
+        return 0.0, 0.0, 0.0
+    
+    values = np.array(values)
+    mean = np.mean(values)
+    std = np.std(values, ddof=1)  # Sample standard deviation
+    n = len(values)
+    
+    # Calculate 95% confidence interval using t-distribution
+    from scipy import stats
+    t_val = stats.t.ppf((1 + confidence) / 2, n - 1)
+    margin_error = t_val * (std / np.sqrt(n))
+    
+    return mean, mean - margin_error, mean + margin_error
 
 
 def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloader, config, scheduler, disc_scheduler, scaler=None, scaler_disc=None, balancer=None, wandb_logger=None):
@@ -148,8 +167,10 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
     total_pesq_wb = 0.0
     num_samples = 0
     
-    # Track metrics per bandwidth
-    bandwidth_metrics = defaultdict(lambda: {'si_snr': 0.0, 'pesq_nb': 0.0, 'pesq_wb': 0.0, 'count': 0})
+    # Track metrics per bandwidth - store individual values for confidence intervals
+    bandwidth_metrics = defaultdict(lambda: {
+        'si_snr': [], 'pesq_nb': [], 'pesq_wb': [], 'count': 0
+    })
     
     for idx, input_wav in enumerate(valloader):
         if torch.cuda.is_available():
@@ -182,18 +203,18 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                     mode='audio'
                 )
                 
-                # Update totals
+                # Update totals and collect individual values
                 if metrics['si_snr'] is not None:
                     total_si_snr += metrics['si_snr']
-                    bandwidth_metrics[bandwidth]['si_snr'] += metrics['si_snr']
+                    bandwidth_metrics[bandwidth]['si_snr'].append(metrics['si_snr'])
                 
                 if metrics['pesq_nb'] is not None:
                     total_pesq_nb += metrics['pesq_nb']
-                    bandwidth_metrics[bandwidth]['pesq_nb'] += metrics['pesq_nb']
+                    bandwidth_metrics[bandwidth]['pesq_nb'].append(metrics['pesq_nb'])
                 
                 if metrics['pesq_wb'] is not None:
                     total_pesq_wb += metrics['pesq_wb']
-                    bandwidth_metrics[bandwidth]['pesq_wb'] += metrics['pesq_wb']
+                    bandwidth_metrics[bandwidth]['pesq_wb'].append(metrics['pesq_wb'])
                 
                 bandwidth_metrics[bandwidth]['count'] += 1
                 num_samples += 1
@@ -207,12 +228,22 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
     log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB | PESQ-NB: {avg_pesq_nb:.3f} | PESQ-WB: {avg_pesq_wb:.3f}"
     logger.info(log_msg)
     
-    # Log bandwidth-specific metrics
+    # Log bandwidth-specific metrics with confidence intervals
     for bandwidth, metrics in bandwidth_metrics.items():
-        avg_bandwidth_si_snr = metrics['si_snr'] / metrics['count']
-        avg_bandwidth_pesq_nb = metrics['pesq_nb'] / metrics['count']
-        avg_bandwidth_pesq_wb = metrics['pesq_wb'] / metrics['count']
-        logger.info(f"  Bandwidth {bandwidth} kbps: SI-SNR = {avg_bandwidth_si_snr:.2f} dB | PESQ-NB = {avg_bandwidth_pesq_nb:.3f} | PESQ-WB = {avg_bandwidth_pesq_wb:.3f}")
+        count = metrics['count']
+        if count > 0:
+            # Calculate confidence intervals
+            si_snr_mean, si_snr_ci_low, si_snr_ci_high = calculate_confidence_interval(metrics['si_snr'])
+            pesq_nb_mean, pesq_nb_ci_low, pesq_nb_ci_high = calculate_confidence_interval(metrics['pesq_nb'])
+            pesq_wb_mean, pesq_wb_ci_low, pesq_wb_ci_high = calculate_confidence_interval(metrics['pesq_wb'])
+            
+            logger.info(f"  Bandwidth {bandwidth} kbps (n={count}):")
+            si_snr_margin = (si_snr_ci_high - si_snr_ci_low) / 2
+            pesq_nb_margin = (pesq_nb_ci_high - pesq_nb_ci_low) / 2
+            pesq_wb_margin = (pesq_wb_ci_high - pesq_wb_ci_low) / 2
+            logger.info(f"    SI-SNR: {si_snr_mean:.2f}±{si_snr_margin:.2f} dB")
+            logger.info(f"    PESQ-NB: {pesq_nb_mean:.3f}±{pesq_nb_margin:.3f}")
+            logger.info(f"    PESQ-WB: {pesq_wb_mean:.3f}±{pesq_wb_margin:.3f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -225,151 +256,25 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             'val/pesq_wb': avg_pesq_wb,
         }
         
-        # Log bandwidth-specific metrics
-        for bandwidth, metrics in bandwidth_metrics.items():
-            avg_bandwidth_si_snr = metrics['si_snr'] / metrics['count']
-            avg_bandwidth_pesq_nb = metrics['pesq_nb'] / metrics['count']
-            avg_bandwidth_pesq_wb = metrics['pesq_wb'] / metrics['count']
-            val_log_dict[f'val/si_snr_bw_{bandwidth}'] = avg_bandwidth_si_snr
-            val_log_dict[f'val/pesq_nb_bw_{bandwidth}'] = avg_bandwidth_pesq_nb
-            val_log_dict[f'val/pesq_wb_bw_{bandwidth}'] = avg_bandwidth_pesq_wb
-        
-        wandb_logger.log(val_log_dict)
-
-
-@torch.no_grad()
-def test(epoch, model, disc_model, testloader, config, wandb_logger=None):
-    """Test function with comprehensive bandwidth-specific metrics."""
-    model.eval()
-    disc_model.eval()
-    
-    total_loss_g = 0.0
-    total_loss_disc = 0.0
-    total_si_snr = 0.0
-    num_samples = 0
-    
-    # Track comprehensive metrics per bandwidth
-    bandwidth_metrics = defaultdict(lambda: {
-        'si_snr': 0.0, 'pesq_nb': 0.0, 'pesq_wb': 0.0, 'stoi': 0.0, 'count': 0
-    })
-    
-    for idx, input_wav in enumerate(testloader):
-        if torch.cuda.is_available():
-            input_wav = input_wav.cuda()
-        
-        # Test all bandwidths
-        for bandwidth in config.model.target_bandwidths:
-            model.bandwidth = bandwidth
-            output = model(input_wav)
-            
-            logits_real, fmap_real = disc_model(input_wav)
-            logits_fake, fmap_fake = disc_model(output)
-            loss_disc = disc_loss(logits_real, logits_fake)
-            losses_g = total_loss(fmap_real, logits_fake, fmap_fake, input_wav, output)
-            
-            total_loss_g += sum([l.item() for l in losses_g.values()])
-            total_loss_disc += loss_disc.item()
-            
-            # Calculate comprehensive metrics for each sample in batch
-            batch_size = input_wav.shape[0]
-            for i in range(batch_size):
-                ref_sample = input_wav[i].squeeze().cpu()
-                rec_sample = output[i].squeeze().cpu()
-                
-                # Calculate all metrics
-                metrics = calculate_all_metrics(
-                    ref_sample.numpy(), 
-                    rec_sample.numpy(), 
-                    sr=config.model.sample_rate, 
-                    mode='audio'
-                )
-                
-                # Update totals
-                if metrics['si_snr'] is not None:
-                    total_si_snr += metrics['si_snr']
-                    bandwidth_metrics[bandwidth]['si_snr'] += metrics['si_snr']
-                
-                if metrics['pesq_nb'] is not None:
-                    bandwidth_metrics[bandwidth]['pesq_nb'] += metrics['pesq_nb']
-                
-                if metrics['pesq_wb'] is not None:
-                    bandwidth_metrics[bandwidth]['pesq_wb'] += metrics['pesq_wb']
-                
-                if metrics['stoi'] is not None:
-                    bandwidth_metrics[bandwidth]['stoi'] += metrics['stoi']
-                
-                bandwidth_metrics[bandwidth]['count'] += 1
-                num_samples += 1
-    
-    avg_loss_g = total_loss_g / (len(testloader) * len(config.model.target_bandwidths))
-    avg_loss_disc = total_loss_disc / (len(testloader) * len(config.model.target_bandwidths))
-    avg_si_snr = total_si_snr / num_samples
-    
-    log_msg = f"| TEST | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB"
-    logger.info(log_msg)
-    
-    # Log bandwidth-specific metrics
-    for bandwidth, metrics in bandwidth_metrics.items():
-        count = metrics['count']
-        if count > 0:
-            avg_si_snr_bw = metrics['si_snr'] / count
-            avg_pesq_nb_bw = metrics['pesq_nb'] / count
-            avg_pesq_wb_bw = metrics['pesq_wb'] / count
-            avg_stoi_bw = metrics['stoi'] / count
-            
-            logger.info(f"  Bandwidth {bandwidth} kbps:")
-            logger.info(f"    SI-SNR: {avg_si_snr_bw:.2f} dB")
-            logger.info(f"    PESQ NB: {avg_pesq_nb_bw:.3f}")
-            logger.info(f"    PESQ WB: {avg_pesq_wb_bw:.3f}")
-            logger.info(f"    STOI: {avg_stoi_bw:.3f}")
-    
-    # Weights & Biases logging
-    if wandb_logger:
-        test_log_dict = {
-            'epoch': epoch,
-            'test/loss_g': avg_loss_g,
-            'test/loss_disc': avg_loss_disc,
-            'test/si_snr': avg_si_snr,
-        }
-        
-        # Log bandwidth-specific metrics
+        # Log bandwidth-specific metrics with confidence intervals
         for bandwidth, metrics in bandwidth_metrics.items():
             count = metrics['count']
             if count > 0:
-                test_log_dict[f'test/si_snr_bw_{bandwidth}'] = metrics['si_snr'] / count
-                test_log_dict[f'test/pesq_nb_bw_{bandwidth}'] = metrics['pesq_nb'] / count
-                test_log_dict[f'test/pesq_wb_bw_{bandwidth}'] = metrics['pesq_wb'] / count
-                test_log_dict[f'test/stoi_bw_{bandwidth}'] = metrics['stoi'] / count
+                si_snr_mean, si_snr_ci_low, si_snr_ci_high = calculate_confidence_interval(metrics['si_snr'])
+                pesq_nb_mean, pesq_nb_ci_low, pesq_nb_ci_high = calculate_confidence_interval(metrics['pesq_nb'])
+                pesq_wb_mean, pesq_wb_ci_low, pesq_wb_ci_high = calculate_confidence_interval(metrics['pesq_wb'])
+                
+                val_log_dict[f'val/si_snr_bw_{bandwidth}'] = si_snr_mean
+                val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_low'] = si_snr_ci_low
+                val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_high'] = si_snr_ci_high
+                val_log_dict[f'val/pesq_nb_bw_{bandwidth}'] = pesq_nb_mean
+                val_log_dict[f'val/pesq_nb_bw_{bandwidth}_ci_low'] = pesq_nb_ci_low
+                val_log_dict[f'val/pesq_nb_bw_{bandwidth}_ci_high'] = pesq_nb_ci_high
+                val_log_dict[f'val/pesq_wb_bw_{bandwidth}'] = pesq_wb_mean
+                val_log_dict[f'val/pesq_wb_bw_{bandwidth}_ci_low'] = pesq_wb_ci_low
+                val_log_dict[f'val/pesq_wb_bw_{bandwidth}_ci_high'] = pesq_wb_ci_high
         
-        wandb_logger.log(test_log_dict)
-    
-    # Log audio samples to wandb
-    if wandb_logger:
-        try:
-            # Get a sample for audio logging
-            input_wav, _ = testloader.dataset.get()
-            if torch.cuda.is_available():
-                input_wav = input_wav.cuda()
-            
-            # Log audio samples for each bandwidth
-            for bandwidth in config.model.target_bandwidths:
-                model.bandwidth = bandwidth
-                output = model(input_wav.unsqueeze(0)).squeeze(0)
-                
-                input_audio = input_wav.cpu().squeeze()
-                output_audio = output.cpu().squeeze()
-                
-                if input_audio.dim() > 1:
-                    input_audio = input_audio.squeeze()
-                if output_audio.dim() > 1:
-                    output_audio = output_audio.squeeze()
-                
-                wandb_logger.log({
-                    f'audio/ground_truth_bw_{bandwidth}': wandb.Audio(input_audio.numpy(), sample_rate=config.model.sample_rate),
-                    f'audio/reconstruction_bw_{bandwidth}': wandb.Audio(output_audio.numpy(), sample_rate=config.model.sample_rate),
-                })
-        except Exception as e:
-            logger.warning(f"Failed to log audio to wandb: {e}")
+        wandb_logger.log(val_log_dict)
 
 
 def train(config):
@@ -413,8 +318,6 @@ def train(config):
 
     # Set up datasets
     trainset = data.MultiDataset(config=config, mode='train')
-    testset = data.MultiDataset(config=config, mode='test')
-    valset = data.MultiDataset(config=config, mode='val')
     
     # Create data loaders
     trainloader = torch.utils.data.DataLoader(
@@ -426,23 +329,6 @@ def train(config):
         pin_memory=config.datasets.pin_memory
     )
     
-    testloader = torch.utils.data.DataLoader(
-        testset,
-        batch_size=config.datasets.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=config.datasets.num_workers,
-        pin_memory=config.datasets.pin_memory
-    )
-    
-    valloader = torch.utils.data.DataLoader(
-        valset,
-        batch_size=config.datasets.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=config.datasets.num_workers,
-        pin_memory=config.datasets.pin_memory
-    )
     
     # Set up models
     model = EncodecModel._get_model(
@@ -502,8 +388,7 @@ def train(config):
         disc_model.cuda()
 
     logger.info(f"Training: {len(trainloader)} batches (batch_size={config.datasets.batch_size})")
-    logger.info(f"Testing: {len(testloader)} batches")
-    logger.info(f"Validation: {len(valloader)} batches")
+    logger.info(f"Validation: 10k segments per epoch with systematic file coverage (batch_size={config.datasets.batch_size})")
 
     # Set up optimizers and schedulers
     params = [p for p in model.parameters() if p.requires_grad]
@@ -564,11 +449,18 @@ def train(config):
         
         # Validation
         if epoch % config.common.val_interval == 0 and epoch > 0:
+            # Create fresh validation dataset with random segments for this epoch
+            valset = data.MultiDataset(config=config, mode='val')
+            valloader = torch.utils.data.DataLoader(
+                valset,
+                batch_size=config.datasets.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=config.datasets.num_workers,
+                pin_memory=config.datasets.pin_memory
+            )
             validate(epoch, model, disc_model, valloader, config, wandb_logger)
         
-        # Testing
-        if epoch % config.common.test_interval == 0 and epoch > 0:
-            test(epoch, model, disc_model, testloader, config, wandb_logger)
         
         # Save checkpoint
         if epoch % config.common.save_interval == 0:
