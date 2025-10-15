@@ -21,7 +21,7 @@ from msstftd import MultiScaleSTFTDiscriminator
 from scheduler import WarmupCosineLrScheduler
 from utils import (count_parameters, save_master_checkpoint, set_seed)
 from balancer import Balancer
-from cal_metrics import calculate_si_snr, calculate_all_metrics
+from cal_metrics import calculate_si_snr
 
 warnings.filterwarnings("ignore")
 
@@ -163,13 +163,11 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
     total_loss_g = 0.0
     total_loss_disc = 0.0
     total_si_snr = 0.0
-    total_pesq_nb = 0.0
-    total_pesq_wb = 0.0
     num_samples = 0
     
     # Track metrics per bandwidth - store individual values for confidence intervals
     bandwidth_metrics = defaultdict(lambda: {
-        'si_snr': [], 'pesq_nb': [], 'pesq_wb': [], 'count': 0
+        'si_snr': [], 'count': 0
     })
     
     for idx, input_wav in enumerate(valloader):
@@ -195,37 +193,25 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 ref_sample = input_wav[i].squeeze().cpu()
                 rec_sample = output[i].squeeze().cpu()
                 
-                # Calculate all metrics
-                metrics = calculate_all_metrics(
-                    ref_sample.numpy(), 
-                    rec_sample.numpy(), 
-                    sr=config.model.sample_rate, 
-                    mode='audio'
-                )
+                # Calculate only SI-SNR metric
+                try:
+                    si_snr = calculate_si_snr(ref_sample.numpy(), rec_sample.numpy())
+                except Exception as e:
+                    si_snr = None
                 
                 # Update totals and collect individual values
-                if metrics['si_snr'] is not None:
-                    total_si_snr += metrics['si_snr']
-                    bandwidth_metrics[bandwidth]['si_snr'].append(metrics['si_snr'])
-                
-                if metrics['pesq_nb'] is not None:
-                    total_pesq_nb += metrics['pesq_nb']
-                    bandwidth_metrics[bandwidth]['pesq_nb'].append(metrics['pesq_nb'])
-                
-                if metrics['pesq_wb'] is not None:
-                    total_pesq_wb += metrics['pesq_wb']
-                    bandwidth_metrics[bandwidth]['pesq_wb'].append(metrics['pesq_wb'])
+                if si_snr is not None:
+                    total_si_snr += si_snr
+                    bandwidth_metrics[bandwidth]['si_snr'].append(si_snr)
                 
                 bandwidth_metrics[bandwidth]['count'] += 1
                 num_samples += 1
     
     avg_loss_g = total_loss_g / (len(valloader) * len(config.model.target_bandwidths))
     avg_loss_disc = total_loss_disc / (len(valloader) * len(config.model.target_bandwidths))
-    avg_si_snr = total_si_snr / num_samples
-    avg_pesq_nb = total_pesq_nb / num_samples if num_samples > 0 else 0.0
-    avg_pesq_wb = total_pesq_wb / num_samples if num_samples > 0 else 0.0
+    avg_si_snr = total_si_snr / num_samples if num_samples > 0 else 0.0
     
-    log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB | PESQ-NB: {avg_pesq_nb:.3f} | PESQ-WB: {avg_pesq_wb:.3f}"
+    log_msg = f"| VAL  | epoch: {epoch} | loss_g: {avg_loss_g:.4f} | loss_disc: {avg_loss_disc:.4f} | SI-SNR: {avg_si_snr:.2f} dB"
     logger.info(log_msg)
     
     # Log bandwidth-specific metrics with confidence intervals
@@ -234,16 +220,10 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
         if count > 0:
             # Calculate confidence intervals
             si_snr_mean, si_snr_ci_low, si_snr_ci_high = calculate_confidence_interval(metrics['si_snr'])
-            pesq_nb_mean, pesq_nb_ci_low, pesq_nb_ci_high = calculate_confidence_interval(metrics['pesq_nb'])
-            pesq_wb_mean, pesq_wb_ci_low, pesq_wb_ci_high = calculate_confidence_interval(metrics['pesq_wb'])
             
             logger.info(f"  Bandwidth {bandwidth} kbps (n={count}):")
             si_snr_margin = (si_snr_ci_high - si_snr_ci_low) / 2
-            pesq_nb_margin = (pesq_nb_ci_high - pesq_nb_ci_low) / 2
-            pesq_wb_margin = (pesq_wb_ci_high - pesq_wb_ci_low) / 2
             logger.info(f"    SI-SNR: {si_snr_mean:.2f}±{si_snr_margin:.2f} dB")
-            logger.info(f"    PESQ-NB: {pesq_nb_mean:.3f}±{pesq_nb_margin:.3f}")
-            logger.info(f"    PESQ-WB: {pesq_wb_mean:.3f}±{pesq_wb_margin:.3f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -252,8 +232,6 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             'val/loss_g': avg_loss_g,
             'val/loss_disc': avg_loss_disc,
             'val/si_snr': avg_si_snr,
-            'val/pesq_nb': avg_pesq_nb,
-            'val/pesq_wb': avg_pesq_wb,
         }
         
         # Log bandwidth-specific metrics with confidence intervals
@@ -261,18 +239,10 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             count = metrics['count']
             if count > 0:
                 si_snr_mean, si_snr_ci_low, si_snr_ci_high = calculate_confidence_interval(metrics['si_snr'])
-                pesq_nb_mean, pesq_nb_ci_low, pesq_nb_ci_high = calculate_confidence_interval(metrics['pesq_nb'])
-                pesq_wb_mean, pesq_wb_ci_low, pesq_wb_ci_high = calculate_confidence_interval(metrics['pesq_wb'])
                 
                 val_log_dict[f'val/si_snr_bw_{bandwidth}'] = si_snr_mean
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_low'] = si_snr_ci_low
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_high'] = si_snr_ci_high
-                val_log_dict[f'val/pesq_nb_bw_{bandwidth}'] = pesq_nb_mean
-                val_log_dict[f'val/pesq_nb_bw_{bandwidth}_ci_low'] = pesq_nb_ci_low
-                val_log_dict[f'val/pesq_nb_bw_{bandwidth}_ci_high'] = pesq_nb_ci_high
-                val_log_dict[f'val/pesq_wb_bw_{bandwidth}'] = pesq_wb_mean
-                val_log_dict[f'val/pesq_wb_bw_{bandwidth}_ci_low'] = pesq_wb_ci_low
-                val_log_dict[f'val/pesq_wb_bw_{bandwidth}_ci_high'] = pesq_wb_ci_high
         
         wandb_logger.log(val_log_dict)
 
