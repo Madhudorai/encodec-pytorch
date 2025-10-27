@@ -4,7 +4,6 @@
 # This script runs training with multiple datasets (jamendo, common_voice, etc.)
 
 echo "Starting multi-dataset EnCodec training..."
-echo "Configuration: 64 batch size, 300 epochs, 2k updates per epoch, 24kHz mono"
 echo "Target bandwidths: 1.5, 3.0, 6.0, 12.0, 24.0 kbps"
 
 # Check if virtual environment exists
@@ -37,7 +36,7 @@ mkdir -p ./checkpoints_multi_dataset/
 echo "Starting training..."
 python train_multi_dataset.py \
     --config-name=config_multi_dataset \
-    common.max_epoch=300 \
+    common.max_epoch=400 \
     datasets.batch_size=16 \
     datasets.fixed_length=32000 \
     model.sample_rate=24000 \

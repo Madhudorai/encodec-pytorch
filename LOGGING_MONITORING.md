@@ -3,33 +3,28 @@
 ## 📊 **Current Logging Setup**
 
 ### **1. Console Output**
-- **Real-time progress**: Epoch, step, losses, learning rates
-- **Format**: `Epoch 1 100/5000	Avg loss_G: 0.1234	Avg loss_W: 0.0567	lr_G: 3.000000e-04	lr_D: 3.000000e-04`
-- **Frequency**: Every `log_interval` steps (default: 100)
+- **Real-time progress**: Epoch, losses, learning rates
+- **Format**: `| TRAIN | epoch: 1 | loss_g: 0.1234 | loss_w: 0.0567 | lr_G: 3.000000e-04 | lr_D: 3.000000e-04`
+- **Frequency**: Every epoch
 
 ### **2. File Logging**
-- **Location**: `./checkpoints_mono_nq2/train_encodec_bs8_lr3e-4.log`
+- **Location**: `./checkpoints_multi_dataset/train_multi_dataset_bs16_lr3e-4.log`
 - **Content**: Complete training log with timestamps
-- **Format**: `2024-01-15 10:30:45: INFO: [train_single_gpu.py: 155]: Epoch 1 100/5000...`
+- **Format**: `2024-01-15 10:30:45: INFO: [train_multi_dataset.py: 139]: | TRAIN | epoch: 1...`
 
-### **3. TensorBoard Logging**
-- **Location**: `./checkpoints_mono_nq2/runs/`
-- **Metrics**: All losses, learning rates, audio samples
-- **View**: `tensorboard --logdir=./checkpoints_mono_nq2/runs/`
-
-### **4. Weights & Biases (wandb) - NEW! 🎉**
-- **Project**: `mono-encodec-nq2`
-- **Run Name**: `mono_encodec_bs8_lr3e-4`
+### **3. Weights & Biases (wandb) - Primary Monitoring Tool 🎉**
+- **Project**: `multi-dataset-encodec`
+- **Run Name**: `multi_dataset_bs64_epochs300_24khz_mono`
 - **Features**:
   - Real-time loss plots
-  - Audio sample playback
   - Model artifact tracking
   - Hyperparameter tracking
-  - System metrics (GPU usage, memory)
+  - Bandwidth-specific metrics with confidence intervals
+  - SI-SNR metrics per bandwidth
 
 ## 🎯 **What Gets Logged**
 
-### **Training Metrics (Every 100 steps)**
+### **Training Metrics (Every epoch)**
 ```
 train/loss_g          # Generator loss
 train/loss_w          # Quantizer loss  
@@ -42,25 +37,29 @@ train/lr_g           # Generator learning rate
 train/lr_d           # Discriminator learning rate
 ```
 
-### **Validation Metrics (Every 5 epochs)**
+### **Validation Metrics (Every validation epoch)**
 ```
-test/loss_g          # Test generator loss
-test/loss_disc       # Test discriminator loss
-test/l_t, test/l_f, test/l_g, test/l_feat  # Individual test losses
+val/loss_g           # Validation generator loss
+val/loss_disc        # Validation discriminator loss
+val/si_snr           # Overall SI-SNR metric
+val/si_snr_bw_1.5    # SI-SNR at 1.5 kbps bandwidth
+val/si_snr_bw_3.0    # SI-SNR at 3.0 kbps bandwidth
+val/si_snr_bw_6.0    # SI-SNR at 6.0 kbps bandwidth
+val/si_snr_bw_12.0   # SI-SNR at 12.0 kbps bandwidth
+val/si_snr_bw_24.0   # SI-SNR at 24.0 kbps bandwidth
 ```
 
-### **Audio Samples (Every 5 epochs)**
-- **Ground Truth**: Original 1-second audio sample
-- **Reconstruction**: Model output audio sample
-- **Location**: `./checkpoints_mono_nq2/GT_epoch{X}.wav` and `Reconstruction_epoch{X}.wav`
-- **wandb**: Audio samples logged for instant playback in browser
+### **Bandwidth-Specific Metrics**
+- **SI-SNR with Confidence Intervals**: Each bandwidth gets individual SI-SNR metrics with 95% confidence intervals
+- **Sample Counts**: Number of samples evaluated per bandwidth
+- **Console Output**: Detailed bandwidth-specific logging with confidence intervals
 
 ## 💾 **Model Checkpoints**
 
 ### **Save Locations**
-- **Main Model**: `./checkpoints_mono_nq2/bs8_cut24000_length0_epoch{X}_lr3e-4.pt`
-- **Discriminator**: `./checkpoints_mono_nq2/bs8_cut24000_length0_epoch{X}_disc_lr3e-4.pt`
-- **Frequency**: Every 2 epochs (configurable)
+- **Main Model**: `./checkpoints_multi_dataset/bs16_cut24000_length32000_epoch{X}_lr3e-4.pt`
+- **Discriminator**: `./checkpoints_multi_dataset/bs16_cut24000_length32000_epoch{X}_disc_lr3e-4.pt`
+- **Frequency**: Every epoch (configurable via `save_interval`)
 
 ### **Checkpoint Contents**
 ```python
@@ -82,70 +81,64 @@ test/l_t, test/l_f, test/l_g, test/l_feat  # Individual test losses
 
 ### **1. Console Monitoring**
 ```bash
-# Just run training and watch console
-python train_single_gpu.py
+# Run training and watch console output
+./run_multi_dataset_training.sh
 ```
 
-### **2. TensorBoard**
-```bash
-# In another terminal
-tensorboard --logdir=./checkpoints_mono_nq2/runs/
-# Open http://localhost:6006
-```
-
-### **3. Weights & Biases**
+### **2. Weights & Biases (Primary Method)**
 ```bash
 # First time: login to wandb
 wandb login
 
 # Run training (wandb auto-initializes)
-python train_single_gpu.py
+./run_multi_dataset_training.sh
 
 # View in browser at https://wandb.ai
 ```
 
-### **4. File Monitoring**
+### **3. File Monitoring**
 ```bash
 # Watch log file in real-time
-tail -f ./checkpoints_mono_nq2/train_encodec_bs8_lr3e-4.log
+tail -f ./checkpoints_multi_dataset/train_multi_dataset_bs16_lr3e-4.log
 
 # Check latest checkpoints
-ls -la ./checkpoints_mono_nq2/*.pt
+ls -la ./checkpoints_multi_dataset/*.pt
 ```
 
 ## ⚙️ **Configuration Options**
 
-### **wandb Settings** (in `config/config_mono_nq2.yaml`)
+### **wandb Settings** (in `config/config_multi_dataset.yaml`)
 ```yaml
 wandb:
   enabled: true                    # Enable/disable wandb
-  project: "mono-encodec-nq2"      # Project name
-  name: "mono_encodec_bs8_lr3e-4"  # Run name
+  project: "multi-dataset-encodec" # Project name
+  name: "multi_dataset_bs64_epochs300_24khz_mono"  # Run name
 ```
 
-### **Logging Frequency** (in `config/config_mono_nq2.yaml`)
+### **Logging Frequency** (in `config/config_multi_dataset.yaml`)
 ```yaml
 common:
-  log_interval: 100    # Console/file logging every N steps
-  test_interval: 5     # Validation every N epochs  
-  save_interval: 2     # Checkpoint every N epochs
+  val_interval: 1     # Validation every N epochs  
+  save_interval: 1    # Checkpoint every N epochs
 ```
 
 ## 📈 **Expected Training Output**
 
 ### **Console Example**
 ```
-2024-01-15 10:30:45: INFO: [train_single_gpu.py: 155]: Epoch 1 100/5000	Avg loss_G: 0.1234	Avg loss_W: 0.0567	lr_G: 3.000000e-04	lr_D: 3.000000e-04	loss_disc: 0.0890
-2024-01-15 10:31:12: INFO: [train_single_gpu.py: 155]: Epoch 1 200/5000	Avg loss_G: 0.1156	Avg loss_W: 0.0523	lr_G: 3.000000e-04	lr_D: 3.000000e-04	loss_disc: 0.0823
-...
-2024-01-15 10:45:30: INFO: [train_single_gpu.py: 188]: | TEST | epoch: 5 | loss_g: 0.0987 | loss_disc: 0.0756
+2024-01-15 10:30:45: INFO: [train_multi_dataset.py: 139]: | TRAIN | epoch: 1 | loss_g: 0.1234 | loss_w: 0.0567 | lr_G: 3.000000e-04 | lr_D: 3.000000e-04 | loss_disc: 0.0890
+2024-01-15 10:31:12: INFO: [train_multi_dataset.py: 214]: | VAL  | epoch: 1 | loss_g: 0.1156 | loss_disc: 0.0823 | SI-SNR: 12.34 dB
+2024-01-15 10:31:12: INFO: [train_multi_dataset.py: 224]:   Bandwidth 1.5 kbps (n=100):
+2024-01-15 10:31:12: INFO: [train_multi_dataset.py: 226]:     SI-SNR: 8.45±0.23 dB
+2024-01-15 10:31:12: INFO: [train_multi_dataset.py: 224]:   Bandwidth 3.0 kbps (n=100):
+2024-01-15 10:31:12: INFO: [train_multi_dataset.py: 226]:     SI-SNR: 12.34±0.18 dB
 ```
 
 ### **wandb Dashboard**
-- **Charts**: Loss curves, learning rate schedules, audio waveforms
-- **Audio**: Play ground truth vs reconstruction samples
+- **Charts**: Loss curves, learning rate schedules, SI-SNR per bandwidth
 - **System**: GPU utilization, memory usage
 - **Artifacts**: Download model checkpoints
+- **Bandwidth Analysis**: Individual SI-SNR metrics with confidence intervals
 
 ## 🔧 **Troubleshooting**
 
@@ -156,35 +149,27 @@ pip install --upgrade wandb
 wandb login
 
 # Disable wandb temporarily
-# Edit config/config_mono_nq2.yaml: wandb.enabled: false
-```
-
-### **TensorBoard Issues**
-```bash
-# If TensorBoard doesn't start
-pip install --upgrade tensorboard
-
-# Clear old logs
-rm -rf ./checkpoints_mono_nq2/runs/*
+# Edit config/config_multi_dataset.yaml: wandb.enabled: false
 ```
 
 ### **Disk Space**
 ```bash
 # Check checkpoint sizes
-du -sh ./checkpoints_mono_nq2/
+du -sh ./checkpoints_multi_dataset/
 
 # Clean old checkpoints (keep last 5)
-ls -t ./checkpoints_mono_nq2/*.pt | tail -n +11 | xargs rm
+ls -t ./checkpoints_multi_dataset/*.pt | tail -n +11 | xargs rm
 ```
 
 ## 🎉 **Benefits of This Setup**
 
 ✅ **Real-time monitoring** - See progress as it happens  
-✅ **Multiple interfaces** - Console, TensorBoard, wandb  
-✅ **Audio quality tracking** - Listen to reconstructions  
+✅ **Multiple interfaces** - Console, file logging, wandb  
+✅ **Bandwidth-specific metrics** - Track performance per compression rate  
+✅ **Confidence intervals** - Statistical rigor in validation metrics  
 ✅ **Model versioning** - Automatic checkpoint management  
 ✅ **Experiment tracking** - Compare different runs  
 ✅ **Remote monitoring** - Access wandb from anywhere  
 ✅ **Reproducibility** - All configs and code tracked  
 
-The training will now provide comprehensive monitoring with both local (console, files, TensorBoard) and cloud (wandb) logging options!
+The training provides comprehensive monitoring with both local (console, files) and cloud (wandb) logging options, with special focus on multi-bandwidth performance analysis!

@@ -18,10 +18,6 @@
 # -------------------------------------------------------------
 # The directory structure of the unpacked data is:
 
-# datasets_fullband 892G
-# +-- dev_testset 1.7G
-# +-- impulse_responses 5.9G
-# +-- noise_fullband 58G
 # \-- clean_fullband 827G
 #     +-- emotional_speech 2.4G
 #     +-- french_speech 62G
@@ -160,20 +156,6 @@ BLOB_NAMES=(
     clean_fullband/datasets_fullband.clean_fullband.vctk_wav48_silence_trimmed_003.tar.bz2
     clean_fullband/datasets_fullband.clean_fullband.vctk_wav48_silence_trimmed_004.tar.bz2
 
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_000.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_001.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_002.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_003.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_004.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_005.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.audioset_006.tar.bz2
-
-    #noise_fullband/datasets_fullband.noise_fullband.freesound_000.tar.bz2
-    #noise_fullband/datasets_fullband.noise_fullband.freesound_001.tar.bz2
-
-    #datasets_fullband.dev_testset_000.tar.bz2
-
-    #datasets_fullband.impulse_responses_000.tar.bz2
 )
 
 ###############################################################

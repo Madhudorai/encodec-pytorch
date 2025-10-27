@@ -9,17 +9,10 @@
 ## Introduction
 This repository is based on [encodec](https://github.com/facebookresearch/encodec) and [EnCodec_Trainer](https://github.com/Mikxox/EnCodec_Trainer).
 
-Based on the [EnCodec_Trainer](https://github.com/Mikxox/EnCodec_Trainer), I have made the following changes:
-- support multi-gpu training.
-- support AMP training (you need to reduce learning rate and scale vq epsilon from 1e-5 to 1e-3, the reason you can check [issue 8](https://github.com/ZhikangNiu/encodec-pytorch/issues/8))
-  - Couldn't work, so don't use amp
-- support hydra configuration management.
-- align the loss functions and hyperparameters.
-- support warmup scheduler in training.
-- support the test script to test the model.
-- support tensorboard to monitor the training process.
-- support 48khz and stereo models, thanks [@leoauri](https://github.com/leoauri) in https://github.com/ZhikangNiu/encodec-pytorch/pull/22.
-- support slurm training, thanks [@leoauri](https://github.com/leoauri). in https://github.com/ZhikangNiu/encodec-pytorch/pull/22.
+Based on the [EnCodec_Trainer](https://github.com/Mikxox/EnCodec_Trainer), new changes:
+- support Weights & Biases (wandb) for monitoring the training process.
+- support multi-dataset training with automatic dataset mixing.
+- support bandwidth-specific metrics with confidence intervals.
 - support loss balancer, thanks [@leoauri](https://github.com/leoauri). in https://github.com/ZhikangNiu/encodec-pytorch/pull/22.
 - You can find all the training scripts in scripts folder
 
@@ -34,7 +27,19 @@ In order to you can run the code, you can install the environment by the help of
 ## Usage
 ### Training
 #### 1. Prepare dataset
-I use the librispeech as the train datasets and use the `datasets/generate_train_file.py` generate train csv which is used in the training process. You can check the `datasets/generate_train_file.py` and `customAudioDataset.py` to understand how to prepare your own dataset.
+This repository supports multi-dataset training with automatic dataset mixing. You can use multiple datasets like:
+- **Jamendo**: Music dataset for diverse audio content
+- **Common Voice**: Speech dataset for voice content  
+- **FSD50K**: Environmental sounds dataset
+- **DNS Challenge 4**: Clean speech dataset
+
+Use the `datasets/generate_dataset_csvs.py` script to generate train/validation/test CSV files for your datasets:
+```bash
+# Generate CSV files with train/val/test split
+python datasets/generate_dataset_csvs.py -i /path/to/your/dataset --three_way_split --train_ratio 0.995 --val_ratio 0.0025 --test_ratio 0.0025
+```
+
+You can check the `datasets/generate_dataset_csvs.py` and `multi_dataset.py` to understand how to prepare your own dataset.
 Also you can use `ln -s` to link the dataset to the `datasets` folder.
 #### [Optional] Docker image
 I provide a dockerfile to build a docker image with all the necessary dependencies.
@@ -50,50 +55,55 @@ docker run encodec:v1 <command> # you can add some parameters, such as -tid
 docker run --gpus=all encodec:v1 <command>
 ```
 #### 2. Train
-You can use the following command to train the model using multi gpu:
+You can use the following command to train the model with multi-dataset support:
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python train_multi_gpu.py \
-                        distributed.torch_distributed_debug=False \
-                        distributed.find_unused_parameters=True \
-                        distributed.world_size=4 \
-                        common.save_interval=2 \
-                        common.test_interval=2 \
-                        common.max_epoch=100 \
-                        datasets.tensor_cut=100000 \
-                        datasets.batch_size=8 \
-                        datasets.train_csv_path=YOUR TRAIN DATA.csv \
-                        lr_scheduler.warmup_epoch=20 \
-                        optimization.lr=5e-5 \
-                        optimization.disc_lr=5e-5 \
+# Multi-dataset training (recommended)
+./run_multi_dataset_training.sh
 ```
-Note: 
-1. if you set a small `datasets.tensor_cut`, you can set a large `datasets.batch_size` to speed up the training process.
-2. when you are training on your own dataset, I suggest you need to choose a moderate-length audio, because If you train your encodec with 1 senconds tensorcut in a small dataset and the encodec model dosen't perform well.
-2. if you encounter bug about `RuntimeError(f"Mismatch in number of params: ours is {len(params)}, at least one worker has a different one.")`. You can use a small `datasets.tensor_cut` to solve this problem.
-3. if your torch version is lower 1.8, you need to check the default value of `torch.stft(return_complex)` in the `audio_to_mel.py`  
-4. if you encounter bug about multi-gpu training, you can try to set `distributed.torch_distributed_debug=True` to get more message about this problem.
-5. the single gpu training method is similar to the multi-gpu training method, you only need to set the `distributed.data_parallel=False` parameter to the command, like this:
-    ```bash
-        python train_multi_gpu.py distributed.data_parallel=False
-                            common.save_interval=5 \
-                            common.max_epoch=100 \
-                            datasets.tensor_cut=72000 \
-                            datasets.batch_size=4 \
-                            datasets.train_csv_path=YOUR TRAIN DATA.csv \
-                            lr_scheduler.warmup_epoch=10 \
-                            optimization.lr=5e-5 \
-                            optimization.disc_lr=5e-5 \
-    ```
-6. the loss is not converged to zero, but the model can be used to compress and decompress the audio. you can use the `compression.sh` to test your model in every log_interval epoch.
-7. the original paper dataset is larger than 17000h, but I only use LibriTTS960h to train the model, so the model is not good enough. If you want to train a better model, you can use the larger dataset.
-8. **The code is not well tested, so there may be some bugs. If you encounter any problems, you can open an issue or contact me by email.**
-9. When I add AMP training, I found the RVQ loss always be `nan`, and I use L2 norm to normalized quantize and x, like the code -> actually, it's unstable.
-    ```python
-        quantize = F.normalize(quantize)  
-        commit_loss = F.mse_loss(quantize.detach(), x)
-    ``` 
-11. When you try to use amp training, you need to reduce learning rate and scale vq epsilon from 1e-5 to 1e-3, the reason you can check [issue 8](https://github.com/ZhikangNiu/encodec-pytorch/issues/8)
-12. I suggest you need to focus on the generator loss, the commit loss it could be not converge, you can check some objective metrics about pesq, stoi.
+
+Or run directly with Python:
+```bash
+python train_multi_dataset.py \
+    --config-name=config_multi_dataset \
+    common.max_epoch=400 \
+    datasets.batch_size=16 \
+    datasets.fixed_length=32000 \
+    model.sample_rate=24000 \
+    model.channels=1 \
+    model.target_bandwidths=[1.5,3.0,6.0,12.0,24.0] \
+    wandb.enabled=true \
+    wandb.project=multi-dataset-encodec \
+    wandb.name=multi_dataset_bs16_epochs400_24khz_mono
+```
+
+**Key Features:**
+- **Multi-dataset training**: Automatically mixes multiple datasets (Jamendo, Common Voice, FSD50K, DNS Challenge 4)
+- **Bandwidth-specific metrics**: Tracks SI-SNR performance for each compression rate (1.5, 3.0, 6.0, 12.0, 24.0 kbps)
+- **Weights & Biases integration**: Real-time monitoring with confidence intervals
+- **Automatic dataset balancing**: Intelligent mixing of different audio types
+
+**Configuration:**
+- Edit `config/config_multi_dataset.yaml` to customize dataset paths and training parameters
+- The model supports multiple bandwidths simultaneously during training
+- Validation includes comprehensive metrics per bandwidth with statistical confidence intervals
+
+**Notes:**
+1. The multi-dataset approach provides better generalization across different audio types
+2. Training includes automatic dataset mixing for robust performance
+3. Monitor training progress via Weights & Biases dashboard
+4. Checkpoints are saved with bandwidth-specific naming conventions
+5. **The code is actively maintained for multi-dataset training scenarios**
+
+#### Legacy Training (Single Dataset)
+For single-dataset training, you can still use the legacy approach:
+```bash
+python train_single_gpu.py \
+    --config-name=config \
+    datasets.train_csv_path=YOUR_TRAIN_DATA.csv \
+    common.max_epoch=100 \
+    datasets.batch_size=8 \
+    optimization.lr=5e-5
+```
 
 #### Slurm
 Usage will depend on your cluster setup, but see `scripts/train.sbatch` for an example. This uses a container with the dependencies installed. Run `sbatch scripts/train.sbatch` from the repository root to use.
