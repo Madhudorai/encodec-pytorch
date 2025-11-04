@@ -75,6 +75,11 @@ python train_multi_dataset.py \
     wandb.project=multi-dataset-encodec \
     wandb.name=multi_dataset_bs16_epochs400_24khz_mono
 ```
+#### 3. Test
+```bash
+python test.py
+```
+Runs checkpoint model on demo ground truth audio files. logs spectrograms, reconstructed audio for different bandwidths to wandb 
 
 **Key Features:**
 - **Multi-dataset training**: Automatically mixes multiple datasets (Jamendo, Common Voice, FSD50K, DNS Challenge 4)
