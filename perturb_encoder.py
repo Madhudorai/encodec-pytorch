@@ -80,14 +80,14 @@ class PerturbEncoder(nn.Module):
         Returns:
             Perturbed audio with random gain applied
         """
-        if self.training:
-            # Randomly decide whether to apply volume augmentation
-            if torch.rand(1).item() < self.volume_aug_config.apply_prob:
-                # Sample random gain
-                min_gain, max_gain = self.volume_aug_config.gain_range
-                gain = torch.rand(1, device=audio.device).item() * (max_gain - min_gain) + min_gain
-                # Apply gain (works for both [B, C, T] and [B, T] shapes)
-                audio = audio * gain
+        # Apply perturbations during both training and validation (for metric computation)
+        # Randomly decide whether to apply volume augmentation
+        if torch.rand(1).item() < self.volume_aug_config.apply_prob:
+            # Sample random gain
+            min_gain, max_gain = self.volume_aug_config.gain_range
+            gain = torch.rand(1, device=audio.device).item() * (max_gain - min_gain) + min_gain
+            # Apply gain (works for both [B, C, T] and [B, T] shapes)
+            audio = audio * gain
         return audio
     
     def forward_inversion_aug(self, audio: torch.Tensor) -> torch.Tensor:
@@ -99,10 +99,10 @@ class PerturbEncoder(nn.Module):
         Returns:
             Inverted audio (if randomly selected)
         """
-        if self.training:
-            # Randomly decide whether to apply inversion
-            if torch.rand(1).item() < self.inversion_aug_config.apply_prob:
-                audio = -audio
+        # Apply perturbations during both training and validation (for metric computation)
+        # Randomly decide whether to apply inversion
+        if torch.rand(1).item() < self.inversion_aug_config.apply_prob:
+            audio = -audio
         return audio
     
     def forward(self, audio: torch.Tensor) -> torch.Tensor:

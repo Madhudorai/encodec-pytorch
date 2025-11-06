@@ -69,7 +69,7 @@ class SliceConsistency(nn.Module):
         self.split_interval_percentage = split_interval_percentage
         self.feature_types = feature_types if feature_types is not None else ["quant_in"]
         self.loss_types = loss_types if loss_types is not None else ["mse_loss"]
-        self.loss_weights = loss_weights if loss_weights is not None else [10.0]
+        self.loss_weights = loss_weights if loss_weights is not None else [20.0]
         self.target_sr = target_sr
         self.ds_rate = ds_rate
         self.mse_loss_reduction = mse_loss_reduction
@@ -237,10 +237,24 @@ class SliceConsistency(nn.Module):
             full_feat = full_features[feature_type]  # [B, T, D] or [K, B, T, D]
             slice_feat = slice_features[feature_type]  # [B, T_slice, D] or [K, B, T_slice, D]
             
-            # Gather features using proper attention masking
-            gathered_features, aligned_slice_features, attention_mask = self.gather_features(
-                full_feat, slice_feat, slice_interval
-            )
+            # Check if both features are the same length (slice vs slice comparison)
+            # If so, we can directly compare without gathering
+            if full_feat.shape[1] == slice_feat.shape[1] and full_feat.dim() == slice_feat.dim():
+                # Direct comparison: slice from original vs slice from perturbed (same length)
+                gathered_features = full_feat
+                aligned_slice_features = slice_feat
+                # Create attention mask for all valid positions
+                if full_feat.dim() == 3:
+                    # [B, T, D]
+                    attention_mask = torch.ones(full_feat.shape[0], full_feat.shape[1], device=full_feat.device, dtype=torch.bool)
+                else:
+                    # [K, B, T, D]
+                    attention_mask = torch.ones(full_feat.shape[0], full_feat.shape[1], full_feat.shape[2], device=full_feat.device, dtype=torch.bool)
+            else:
+                # Gather features using proper attention masking (full vs slice comparison)
+                gathered_features, aligned_slice_features, attention_mask = self.gather_features(
+                    full_feat, slice_feat, slice_interval
+                )
             
             # Compute loss based on loss type
             if self.loss_types[i] == "mse_loss":
@@ -281,7 +295,202 @@ class SliceConsistency(nn.Module):
             loss_dict[f"{feature_type}_{self.loss_types[i]}"] = weighted_loss
             total_loss = total_loss + weighted_loss
         
-        return {
+        # Compute codebook consistency accuracy if codebook indices are provided
+        codebook_accuracy = None
+        first_codebook_accuracy = None
+        codebook_accuracies = {}  # Store accuracy for each codebook
+        
+        if codebook_indices is not None and slice_codebook_indices is not None:
+            # codebook_indices: [K, B, T] - could be from full audio or slice from original
+            # slice_codebook_indices: [K, B, T_slice] - could be from slice or slice from perturbed
+            # slice_interval: has start_split, end_split, split_interval_lengths
+            
+            K, B, T = codebook_indices.shape
+            _, _, T_slice = slice_codebook_indices.shape
+            
+            # Check if both are the same length (slice vs slice comparison)
+            if T == T_slice:
+                # Direct comparison: slice from original vs slice from perturbed (same length)
+                gathered_full_indices = codebook_indices  # [K, B, T]
+                aligned_slice_indices = slice_codebook_indices  # [K, B, T_slice] where T == T_slice
+                # Create attention mask for all valid positions
+                attention_mask = torch.ones(K, B, T, device=device, dtype=torch.bool)
+            else:
+                # Gather codebook indices from full audio at overlapping positions
+                start_split = slice_interval.start_split  # [B]
+                end_split = slice_interval.end_split  # [B]
+                split_interval_lengths = slice_interval.split_interval_lengths  # [B]
+                max_interval_length = split_interval_lengths.max().item()
+                
+                # Gather codebook indices from full audio at overlapping positions
+                # Create indices for gathering: [K, B, interval_length]
+                indices = torch.arange(max_interval_length, device=device).expand(K, B, max_interval_length)
+                start_split_expanded = start_split.unsqueeze(0).unsqueeze(-1)  # [1, B, 1]
+                adjusted_indices = start_split_expanded + indices  # [K, B, interval_length]
+                
+                # Create attention mask
+                end_split_expanded = end_split.unsqueeze(0).unsqueeze(-1)  # [1, B, 1]
+                attention_mask = adjusted_indices < end_split_expanded.expand(K, B, max_interval_length)
+                
+                # Gather full codebook indices at overlapping positions
+                gathered_full_indices = torch.gather(
+                    codebook_indices,  # [K, B, T]
+                    2,  # gather along time dimension
+                    adjusted_indices.clamp(0, T - 1)  # [K, B, interval_length]
+                )  # [K, B, interval_length]
+                
+                # Align slice codebook indices to same length
+                if T_slice >= max_interval_length:
+                    aligned_slice_indices = slice_codebook_indices[:, :, :max_interval_length]  # [K, B, interval_length]
+                else:
+                    # Pad if slice is shorter (pad with -1 to indicate invalid)
+                    padding = torch.full(
+                        (K, B, max_interval_length - T_slice),
+                        -1, device=device, dtype=slice_codebook_indices.dtype
+                    )
+                    aligned_slice_indices = torch.cat([slice_codebook_indices, padding], dim=2)
+            
+            # Apply attention mask - need to handle per-codebook mask
+            # For each codebook, create its own attention mask
+            codebook_attention_mask = attention_mask  # [K, B, interval_length]
+            
+            # Compute accuracy for each codebook
+            for k in range(K):
+                # Get attention mask for this codebook (first dimension is batch, second is time)
+                cb_attention = codebook_attention_mask[k]  # [B, interval_length]
+                
+                # Get indices for this codebook
+                gathered_cb = gathered_full_indices[k]  # [B, interval_length]
+                aligned_cb = aligned_slice_indices[k]  # [B, interval_length]
+                
+                # Compute matches: indices match AND both are valid (not -1) AND within attention mask
+                valid_mask = (gathered_cb >= 0) & (aligned_cb >= 0) & cb_attention
+                matches = (gathered_cb == aligned_cb) & valid_mask
+                
+                # Compute accuracy for this codebook
+                total_valid = valid_mask.sum().item()
+                if total_valid > 0:
+                    acc = matches.sum().item() / total_valid
+                    codebook_accuracies[f'codebook{k}_accuracy'] = acc
+                else:
+                    codebook_accuracies[f'codebook{k}_accuracy'] = 0.0
+            
+            # Overall accuracy across all codebooks
+            all_valid = ((gathered_full_indices >= 0) & (aligned_slice_indices >= 0) & codebook_attention_mask)
+            all_matches = (gathered_full_indices == aligned_slice_indices) & all_valid
+            total_valid = all_valid.sum().item()
+            if total_valid > 0:
+                codebook_accuracy = all_matches.sum().item() / total_valid
+            else:
+                codebook_accuracy = 0.0
+            
+            # First codebook accuracy (most important)
+            if K > 0 and 'codebook0_accuracy' in codebook_accuracies:
+                first_codebook_accuracy = codebook_accuracies['codebook0_accuracy']
+            
+            # First 3 codebooks average accuracy
+            if K >= 3:
+                first_3_accs = [codebook_accuracies.get(f'codebook{k}_accuracy', 0.0) for k in range(3)]
+                codebook_accuracies['first_3_codebooks_accuracy'] = sum(first_3_accs) / 3.0
+        
+        result = {
             'loss': total_loss,
             'loss_dict': loss_dict,
         }
+        
+        if codebook_accuracy is not None:
+            result['codebook_accuracy'] = codebook_accuracy
+        if first_codebook_accuracy is not None:
+            result['first_codebook_accuracy'] = first_codebook_accuracy
+        
+        # Add all codebook accuracies to result
+        result.update(codebook_accuracies)
+        
+        return result
+    
+    def compute_augmentation_consistency(
+        self,
+        original_codebook_indices: torch.Tensor,
+        perturbed_codebook_indices: torch.Tensor,
+        attention_mask: tp.Optional[torch.Tensor] = None,
+    ) -> tp.Dict[str, float]:
+        """Compute augmentation consistency accuracy.
+        
+        Compares codebook indices between original full audio and perturbed full audio.
+        This measures how consistent the model is when the same audio is perturbed.
+        
+        Args:
+            original_codebook_indices: Original full audio codebook indices [K, B, T]
+            perturbed_codebook_indices: Perturbed full audio codebook indices [K, B, T]
+            attention_mask: Optional attention mask [B, T] or [K, B, T]
+            
+        Returns:
+            Dictionary with augmentation consistency accuracy metrics:
+                - 'augmentation_consistency_accuracy': Overall accuracy across all codebooks
+                - 'augmentation_consistency_codebook0_accuracy': First codebook accuracy
+                - 'augmentation_consistency_first_3_codebooks_accuracy': Average of first 3 codebooks
+                - 'augmentation_consistency_codebook{k}_accuracy': Accuracy for each codebook k
+        """
+        device = original_codebook_indices.device
+        K, B, T = original_codebook_indices.shape
+        
+        # Ensure shapes match
+        if perturbed_codebook_indices.shape != original_codebook_indices.shape:
+            # If lengths differ, use minimum length
+            min_T = min(T, perturbed_codebook_indices.shape[2])
+            original_codebook_indices = original_codebook_indices[:, :, :min_T]
+            perturbed_codebook_indices = perturbed_codebook_indices[:, :, :min_T]
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    attention_mask = attention_mask[:, :min_T]
+                else:
+                    attention_mask = attention_mask[:, :, :min_T]
+            T = min_T
+        
+        # Create attention mask if not provided (all positions are valid)
+        if attention_mask is None:
+            attention_mask = torch.ones(K, B, T, device=device, dtype=torch.bool)
+        elif attention_mask.dim() == 2:
+            # [B, T] -> [K, B, T]
+            attention_mask = attention_mask.unsqueeze(0).expand(K, -1, -1)
+        
+        # Compute accuracy for each codebook
+        augmentation_accuracies = {}
+        
+        for k in range(K):
+            # Get codebook indices for this codebook
+            orig_cb = original_codebook_indices[k]  # [B, T]
+            pert_cb = perturbed_codebook_indices[k]  # [B, T]
+            cb_attention = attention_mask[k]  # [B, T]
+            
+            # Compute matches: indices match AND within attention mask
+            valid_mask = cb_attention
+            matches = (orig_cb == pert_cb) & valid_mask
+            
+            # Compute accuracy for this codebook
+            total_valid = valid_mask.sum().item()
+            if total_valid > 0:
+                acc = matches.sum().item() / total_valid
+                augmentation_accuracies[f'augmentation_consistency_codebook{k}_accuracy'] = acc
+            else:
+                augmentation_accuracies[f'augmentation_consistency_codebook{k}_accuracy'] = 0.0
+        
+        # Overall accuracy across all codebooks
+        all_valid = attention_mask
+        all_matches = (original_codebook_indices == perturbed_codebook_indices) & all_valid
+        total_valid = all_valid.sum().item()
+        if total_valid > 0:
+            augmentation_accuracies['augmentation_consistency_accuracy'] = all_matches.sum().item() / total_valid
+        else:
+            augmentation_accuracies['augmentation_consistency_accuracy'] = 0.0
+        
+        # First codebook accuracy (most important)
+        if K > 0 and 'augmentation_consistency_codebook0_accuracy' in augmentation_accuracies:
+            augmentation_accuracies['augmentation_consistency_codebook0_accuracy'] = augmentation_accuracies['augmentation_consistency_codebook0_accuracy']
+        
+        # First 3 codebooks average accuracy
+        if K >= 3:
+            first_3_accs = [augmentation_accuracies.get(f'augmentation_consistency_codebook{k}_accuracy', 0.0) for k in range(3)]
+            augmentation_accuracies['augmentation_consistency_first_3_codebooks_accuracy'] = sum(first_3_accs) / 3.0
+        
+        return augmentation_accuracies

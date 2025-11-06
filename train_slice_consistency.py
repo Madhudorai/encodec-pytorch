@@ -230,6 +230,15 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
         'si_snr': [], 'count': 0
     })
     
+    # Track consistency accuracy metrics
+    slice_consistency_accuracies = defaultdict(list)  # Original full vs original slice
+    slice_consistency_first_codebook = defaultdict(list)
+    slice_consistency_first_3_codebooks = defaultdict(list)
+    
+    augmentation_consistency_accuracies = defaultdict(list)  # Original full vs perturbed full
+    augmentation_consistency_first_codebook = defaultdict(list)
+    augmentation_consistency_first_3_codebooks = defaultdict(list)
+    
     for idx, input_wav in enumerate(valloader):
         if torch.cuda.is_available():
             input_wav = input_wav.cuda()
@@ -237,7 +246,13 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
         # Test all bandwidths
         for bandwidth in config.model.target_bandwidths:
             model.bandwidth = bandwidth
-            output = model(input_wav)  # No slice consistency in eval mode
+            
+            # Enable slice consistency during validation to compute accuracy metrics
+            if model.use_slice_consistency:
+                output, loss_w, frames, slice_consistency_output = model(input_wav, return_slice_consistency=True)
+            else:
+                output = model(input_wav)
+                slice_consistency_output = None
             
             logits_real, fmap_real = disc_model(input_wav)
             logits_fake, fmap_fake = disc_model(output)
@@ -246,6 +261,24 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             
             total_loss_g += sum([l.item() for l in losses_g.values()])
             total_loss_disc += loss_disc.item()
+            
+            # Extract consistency accuracy metrics if available
+            if slice_consistency_output is not None:
+                # Slice consistency metrics (original full vs original slice)
+                if 'slice_consistency_accuracy' in slice_consistency_output:
+                    slice_consistency_accuracies[bandwidth].append(slice_consistency_output['slice_consistency_accuracy'])
+                if 'slice_consistency_codebook0_accuracy' in slice_consistency_output:
+                    slice_consistency_first_codebook[bandwidth].append(slice_consistency_output['slice_consistency_codebook0_accuracy'])
+                if 'slice_consistency_first_3_codebooks_accuracy' in slice_consistency_output:
+                    slice_consistency_first_3_codebooks[bandwidth].append(slice_consistency_output['slice_consistency_first_3_codebooks_accuracy'])
+                
+                # Augmentation consistency metrics (original full vs perturbed full)
+                if 'augmentation_consistency_accuracy' in slice_consistency_output:
+                    augmentation_consistency_accuracies[bandwidth].append(slice_consistency_output['augmentation_consistency_accuracy'])
+                if 'augmentation_consistency_codebook0_accuracy' in slice_consistency_output:
+                    augmentation_consistency_first_codebook[bandwidth].append(slice_consistency_output['augmentation_consistency_codebook0_accuracy'])
+                if 'augmentation_consistency_first_3_codebooks_accuracy' in slice_consistency_output:
+                    augmentation_consistency_first_3_codebooks[bandwidth].append(slice_consistency_output['augmentation_consistency_first_3_codebooks_accuracy'])
             
             # Calculate comprehensive metrics for each sample in batch
             batch_size = input_wav.shape[0]
@@ -284,6 +317,38 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             logger.info(f"  Bandwidth {bandwidth} kbps (n={count}):")
             si_snr_margin = (si_snr_ci_high - si_snr_ci_low) / 2
             logger.info(f"    SI-SNR: {si_snr_mean:.2f}±{si_snr_margin:.2f} dB")
+            
+            # Log slice consistency accuracy metrics (original full vs original slice)
+            if bandwidth in slice_consistency_accuracies and len(slice_consistency_accuracies[bandwidth]) > 0:
+                slice_acc = slice_consistency_accuracies[bandwidth]
+                avg_slice = sum(slice_acc) / len(slice_acc)
+                logger.info(f"    Slice Consistency Accuracy: {avg_slice:.4f}")
+            
+            if bandwidth in slice_consistency_first_codebook and len(slice_consistency_first_codebook[bandwidth]) > 0:
+                slice_cb0 = slice_consistency_first_codebook[bandwidth]
+                avg_slice_cb0 = sum(slice_cb0) / len(slice_cb0)
+                logger.info(f"    Slice Consistency First Codebook: {avg_slice_cb0:.4f}")
+            
+            if bandwidth in slice_consistency_first_3_codebooks and len(slice_consistency_first_3_codebooks[bandwidth]) > 0:
+                slice_3 = slice_consistency_first_3_codebooks[bandwidth]
+                avg_slice_3 = sum(slice_3) / len(slice_3)
+                logger.info(f"    Slice Consistency First 3 Codebooks: {avg_slice_3:.4f}")
+            
+            # Log augmentation consistency accuracy metrics (original full vs perturbed full)
+            if bandwidth in augmentation_consistency_accuracies and len(augmentation_consistency_accuracies[bandwidth]) > 0:
+                aug_acc = augmentation_consistency_accuracies[bandwidth]
+                avg_aug = sum(aug_acc) / len(aug_acc)
+                logger.info(f"    Augmentation Consistency Accuracy: {avg_aug:.4f}")
+            
+            if bandwidth in augmentation_consistency_first_codebook and len(augmentation_consistency_first_codebook[bandwidth]) > 0:
+                aug_cb0 = augmentation_consistency_first_codebook[bandwidth]
+                avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
+                logger.info(f"    Augmentation Consistency First Codebook: {avg_aug_cb0:.4f}")
+            
+            if bandwidth in augmentation_consistency_first_3_codebooks and len(augmentation_consistency_first_3_codebooks[bandwidth]) > 0:
+                aug_3 = augmentation_consistency_first_3_codebooks[bandwidth]
+                avg_aug_3 = sum(aug_3) / len(aug_3)
+                logger.info(f"    Augmentation Consistency First 3 Codebooks: {avg_aug_3:.4f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -303,6 +368,38 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 val_log_dict[f'val/si_snr_bw_{bandwidth}'] = si_snr_mean
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_low'] = si_snr_ci_low
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_high'] = si_snr_ci_high
+                
+                # Log slice consistency accuracy metrics (original full vs original slice)
+                if bandwidth in slice_consistency_accuracies and len(slice_consistency_accuracies[bandwidth]) > 0:
+                    slice_acc = slice_consistency_accuracies[bandwidth]
+                    avg_slice = sum(slice_acc) / len(slice_acc)
+                    val_log_dict[f'val/slice_consistency_accuracy_bw_{bandwidth}'] = avg_slice
+                
+                if bandwidth in slice_consistency_first_codebook and len(slice_consistency_first_codebook[bandwidth]) > 0:
+                    slice_cb0 = slice_consistency_first_codebook[bandwidth]
+                    avg_slice_cb0 = sum(slice_cb0) / len(slice_cb0)
+                    val_log_dict[f'val/slice_consistency_codebook0_bw_{bandwidth}'] = avg_slice_cb0
+                
+                if bandwidth in slice_consistency_first_3_codebooks and len(slice_consistency_first_3_codebooks[bandwidth]) > 0:
+                    slice_3 = slice_consistency_first_3_codebooks[bandwidth]
+                    avg_slice_3 = sum(slice_3) / len(slice_3)
+                    val_log_dict[f'val/slice_consistency_first_3_codebooks_bw_{bandwidth}'] = avg_slice_3
+                
+                # Log augmentation consistency accuracy metrics (original full vs perturbed full)
+                if bandwidth in augmentation_consistency_accuracies and len(augmentation_consistency_accuracies[bandwidth]) > 0:
+                    aug_acc = augmentation_consistency_accuracies[bandwidth]
+                    avg_aug = sum(aug_acc) / len(aug_acc)
+                    val_log_dict[f'val/augmentation_consistency_accuracy_bw_{bandwidth}'] = avg_aug
+                
+                if bandwidth in augmentation_consistency_first_codebook and len(augmentation_consistency_first_codebook[bandwidth]) > 0:
+                    aug_cb0 = augmentation_consistency_first_codebook[bandwidth]
+                    avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
+                    val_log_dict[f'val/augmentation_consistency_codebook0_bw_{bandwidth}'] = avg_aug_cb0
+                
+                if bandwidth in augmentation_consistency_first_3_codebooks and len(augmentation_consistency_first_3_codebooks[bandwidth]) > 0:
+                    aug_3 = augmentation_consistency_first_3_codebooks[bandwidth]
+                    avg_aug_3 = sum(aug_3) / len(aug_3)
+                    val_log_dict[f'val/augmentation_consistency_first_3_codebooks_bw_{bandwidth}'] = avg_aug_3
         
         wandb_logger.log(val_log_dict)
 
@@ -535,6 +632,29 @@ def train(config):
                 artifact.add_file(model_path)
                 artifact.add_file(disc_path)
                 wandb_logger.log_artifact(artifact)
+            
+            # Delete previous epoch's checkpoints to save space (keep only latest locally)
+            # Since everything is logged to wandb, we only need the most recent checkpoint for resuming
+            prev_epoch = epoch - config.common.save_interval
+            if prev_epoch > 0 and prev_epoch % config.common.save_interval == 0:
+                prev_model_path = f'{config.checkpoint.save_location}epoch{prev_epoch}_lr{config.optimization.lr}.pt'
+                prev_disc_path = f'{config.checkpoint.save_location}epoch{prev_epoch}_disc_lr{config.optimization.lr}.pt'
+                
+                # Delete previous model checkpoint if it exists
+                if os.path.exists(prev_model_path):
+                    try:
+                        os.remove(prev_model_path)
+                        logger.info(f"Deleted previous checkpoint: {prev_model_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {prev_model_path}: {e}")
+                
+                # Delete previous discriminator checkpoint if it exists
+                if os.path.exists(prev_disc_path):
+                    try:
+                        os.remove(prev_disc_path)
+                        logger.info(f"Deleted previous checkpoint: {prev_disc_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {prev_disc_path}: {e}")
     
     # Finish wandb run
     if wandb_logger:

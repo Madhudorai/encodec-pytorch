@@ -46,7 +46,7 @@ python train_slice_consistency.py \
     model.slice_consistency.slice_interval_type=random \
     model.slice_consistency.split_interval_percentage=0.2 \
     model.slice_consistency.feature_types=["quant_in"] \
-    model.slice_consistency.loss_weights=[10.0] \
+    model.slice_consistency.loss_weights=[20.0] \
     model.perturb_encoder.perturb_methods=["volume_aug","inversion_aug"] \
     model.perturb_encoder.perturb_all_audio=true \
     model.perturb_encoder.perturb_slice_audio=true \

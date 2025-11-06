@@ -66,7 +66,7 @@ model:
     split_interval_percentage: 0.2  # 20% of audio length for random slices
     feature_types: ["quant_in"]  # Features to compare: ["quant_in", "quant_out", "sub_quants"]
     loss_types: ["mse_loss"]  # Loss types: ["mse_loss"]
-    loss_weights: [10.0]  # Weight for slice consistency loss
+    loss_weights: [20.0]  # Weight for slice consistency loss
     target_sr: 24000
     ds_rate: 320  # Downsampling rate (encoder hop length)
     mse_loss_reduction: mean  # "mean" or "sum"
