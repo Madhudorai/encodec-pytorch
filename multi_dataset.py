@@ -125,9 +125,10 @@ class MultiDataset(torch.utils.data.Dataset):
         
         segments = []
         
-        # For validation, create 10k random segments every epoch
+        # For validation, create 10k fixed segments (same every epoch)
         if self.mode == 'val':
             num_segments = 10000
+            random.seed(42)  # Fixed seed for reproducible validation segments
         else:  # test mode
             num_segments = 1000
             random.seed(42)  # Fixed seed for reproducible test evaluation
@@ -156,6 +157,7 @@ class MultiDataset(torch.utils.data.Dataset):
         
         if self.mode == 'test':
             random.seed()  # Reset to random seed only for test mode
+        # For validation, keep fixed seed (don't reset)
         
         logger.info(f"Created {len(segments)} segments for {self.mode}")
         return segments

@@ -248,10 +248,11 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             model.bandwidth = bandwidth
             
             # Enable slice consistency during validation to compute accuracy metrics
+            # Pass batch_idx for deterministic slice positions and perturbations
             if model.use_slice_consistency:
-                output, loss_w, frames, slice_consistency_output = model(input_wav, return_slice_consistency=True)
+                output, loss_w, frames, slice_consistency_output = model(input_wav, return_slice_consistency=True, batch_idx=idx)
             else:
-                output = model(input_wav)
+                output = model(input_wav, batch_idx=idx)
                 slice_consistency_output = None
             
             logits_real, fmap_real = disc_model(input_wav)
@@ -532,7 +533,7 @@ def train(config):
         loaded_epoch = model_checkpoint['epoch']
         
         logger.info(f"✓ Successfully loaded model weights from epoch {loaded_epoch}")
-        logger.info(f"  Starting training from epoch 1 (fresh training with loaded weights)")
+        logger.info(f"  Starting training from epoch {loaded_epoch + 1} (continuing from loaded weights)")
 
     if torch.cuda.is_available():
         model.cuda()
@@ -584,9 +585,9 @@ def train(config):
             disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
             logger.info(f"✓ Loaded discriminator scheduler state from epoch {loaded_epoch}")
 
-    # Start training from epoch 1 (even though we loaded weights from epoch 303)
-    # This allows fresh logging and training continuation
-    start_epoch = 1
+    # Start training from loaded_epoch + 1 if resuming, otherwise from epoch 1
+    # This allows proper training continuation
+    start_epoch = loaded_epoch + 1 if config.checkpoint.resume else 1
     
     # Instantiate loss balancer
     balancer = Balancer(dict(config.balancer.weights)) if hasattr(config, 'balancer') else None
@@ -603,7 +604,8 @@ def train(config):
         
         # Validation
         if epoch % config.common.val_interval == 0 and epoch > 0:
-            # Create fresh validation dataset with mixed audio segments for this epoch
+            # Create validation dataset with fixed segments (same every epoch)
+            # Note: dataset is recreated but uses fixed seed, so segments are identical
             valset = data.MultiDataset(config=config, mode='val')
             valloader = torch.utils.data.DataLoader(
                 valset,

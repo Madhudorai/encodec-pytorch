@@ -70,6 +70,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         x: torch.Tensor, 
         return_embeddings: bool = False,
         return_slice_consistency: bool = False,
+        batch_idx: tp.Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass with optional slice consistency computation.
         
@@ -120,7 +121,14 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         # So if perturb_all_audio is True, we always augment the full audio
         # (Individual augmentations have their own apply_prob for probabilistic application)
         if self.perturb_encoder is not None and self.perturb_encoder.perturb_all_audio:
-            x = self.perturb_encoder(x)
+            # Only create sample indices for deterministic behavior (validation), skip in training for speed
+            if batch_idx is not None:
+                batch_size = x.shape[0]
+                sample_indices = torch.arange(batch_size, device=x.device)
+                x = self.perturb_encoder(x, batch_idx=batch_idx, sample_indices=sample_indices)
+            else:
+                # Training mode: use simple call without extra parameters (faster)
+                x = self.perturb_encoder(x)
         
         frames = self.encode(x)
         
@@ -242,10 +250,22 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         split_interval_lengths
                     )
                     
-                    # Random start positions in feature space
+                    # Deterministic start positions in feature space (for validation) or random (for training)
                     max_start_feature = feature_lengths - split_interval_lengths
                     max_start_feature = torch.clamp(max_start_feature, min=0)
-                    start_positions_feature = (torch.rand(batch_size, device=emb.device) * max_start_feature.float()).long()
+                    if batch_idx is not None and not self.training:
+                        # Deterministic mode: use batch_idx and sample indices to create deterministic positions
+                        generator = torch.Generator(device=emb.device)
+                        start_positions_feature = torch.zeros(batch_size, device=emb.device, dtype=torch.long)
+                        for b in range(batch_size):
+                            # Create deterministic seed from batch_idx and sample index
+                            seed = (batch_idx * 1000 + b) % (2**31)
+                            generator.manual_seed(seed)
+                            start_pos = (torch.rand(1, generator=generator, device=emb.device) * max_start_feature[b].float()).long().item()
+                            start_positions_feature[b] = start_pos
+                    else:
+                        # Random mode (training)
+                        start_positions_feature = (torch.rand(batch_size, device=emb.device) * max_start_feature.float()).long()
                     end_positions_feature = torch.clamp(start_positions_feature + split_interval_lengths, max=feature_lengths)
                     
                     # Convert feature positions to audio positions
@@ -489,7 +509,14 @@ class EncodecModelWithSliceConsistency(EncodecModel):
             
             # Apply perturbation to full audio if enabled (even in eval mode for validation metrics)
             if self.perturb_encoder is not None and self.perturb_encoder.perturb_all_audio:
-                x = self.perturb_encoder(x)
+                # Only create sample indices for deterministic behavior (validation), skip in training for speed
+                if batch_idx is not None:
+                    batch_size = x.shape[0]
+                    sample_indices = torch.arange(batch_size, device=x.device)
+                    x = self.perturb_encoder(x, batch_idx=batch_idx, sample_indices=sample_indices)
+                else:
+                    # Training mode: use simple call without extra parameters (faster)
+                    x = self.perturb_encoder(x)
             
             # In eval mode, encode() returns codes, not embeddings
             # We need to get embeddings directly from the encoder
@@ -636,10 +663,22 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         split_interval_lengths
                     )
                     
-                    # Random start positions in feature space
+                    # Deterministic start positions in feature space (for validation) or random (for training)
                     max_start_feature = feature_lengths - split_interval_lengths
                     max_start_feature = torch.clamp(max_start_feature, min=0)
-                    start_positions_feature = (torch.rand(batch_size, device=emb.device) * max_start_feature.float()).long()
+                    if batch_idx is not None and not self.training:
+                        # Deterministic mode: use batch_idx and sample indices to create deterministic positions
+                        generator = torch.Generator(device=emb.device)
+                        start_positions_feature = torch.zeros(batch_size, device=emb.device, dtype=torch.long)
+                        for b in range(batch_size):
+                            # Create deterministic seed from batch_idx and sample index
+                            seed = (batch_idx * 1000 + b) % (2**31)
+                            generator.manual_seed(seed)
+                            start_pos = (torch.rand(1, generator=generator, device=emb.device) * max_start_feature[b].float()).long().item()
+                            start_positions_feature[b] = start_pos
+                    else:
+                        # Random mode (training)
+                        start_positions_feature = (torch.rand(batch_size, device=emb.device) * max_start_feature.float()).long()
                     end_positions_feature = torch.clamp(start_positions_feature + split_interval_lengths, max=feature_lengths)
                     
                     # Convert to audio positions

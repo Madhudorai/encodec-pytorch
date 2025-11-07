@@ -1,6 +1,6 @@
 common:
   save_interval: 1
-  val_interval: 1
+  val_interval: 10
   log_interval: 100
   max_epoch: 400
   seed: 3401
@@ -32,8 +32,8 @@ datasets:
 
 checkpoint:
   resume: True
-  checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-10-21/23-31-14/checkpoints_multi_dataset/bs16_cut24000_length32000_epoch300_lr0.0003.pt'
-  disc_checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-10-21/23-31-14/checkpoints_multi_dataset/bs16_cut24000_length32000_epoch300_disc_lr0.0003.pt'
+  checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-11-07/04-13-14/checkpoints_multi_dataset_slice_consistency/bs16_cut24000_length32000_epoch9_lr0.0003.pt'
+  disc_checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-11-07/04-13-14/checkpoints_multi_dataset_slice_consistency/bs16_cut24000_length32000_epoch9_disc_lr0.0003.pt'
   save_folder: './checkpoints_multi_dataset_slice_consistency/'
   save_location: '${checkpoint.save_folder}/bs${datasets.batch_size}_cut${datasets.tensor_cut}_length${datasets.fixed_length}_' 
 
