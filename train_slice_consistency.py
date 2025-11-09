@@ -533,7 +533,7 @@ def train(config):
         loaded_epoch = model_checkpoint['epoch']
         
         logger.info(f"✓ Successfully loaded model weights from epoch {loaded_epoch}")
-        logger.info(f"  Starting training from epoch {loaded_epoch + 1} (continuing from loaded weights)")
+        logger.info(f"  Starting training from epoch 1 (fresh training with loaded weights)")
 
     if torch.cuda.is_available():
         model.cuda()
@@ -585,9 +585,9 @@ def train(config):
             disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
             logger.info(f"✓ Loaded discriminator scheduler state from epoch {loaded_epoch}")
 
-    # Start training from loaded_epoch + 1 if resuming, otherwise from epoch 1
-    # This allows proper training continuation
-    start_epoch = loaded_epoch + 1 if config.checkpoint.resume else 1
+    # Start training from epoch 1 (fresh training with loaded weights)
+    # This allows fresh logging and training continuation
+    start_epoch = 1
     
     # Instantiate loss balancer
     balancer = Balancer(dict(config.balancer.weights)) if hasattr(config, 'balancer') else None

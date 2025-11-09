@@ -688,10 +688,8 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     audio_length = orig_audio.shape[2] if orig_audio is not None else x.shape[2]
                     end_positions_audio = torch.clamp(end_positions_audio, max=audio_length)
                     
-                    # Extract the SAME slice from both original and perturbed full audio
-                    # This aligns latent representations from slice-consistency and perturbation-consistency methods
-                    
-                    # Extract slice from original full audio
+                    # Extract slice from original audio and encode it standalone
+                    # This is Z_slice_original: slice cut from original → encoded standalone
                     slice_from_original_list = []
                     for b in range(batch_size):
                         start_pos = start_positions_audio[b].item()
@@ -705,86 +703,109 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                             slice_from_original_list.append(source_orig[b:b+1, :, start_pos:start_pos+1])
                     slice_from_original = torch.cat(slice_from_original_list, dim=0)  # [B, C, T_slice]
                     
-                    # Extract the SAME slice from perturbed full audio
-                    slice_from_perturbed_list = []
-                    for b in range(batch_size):
-                        start_pos = start_positions_audio[b].item()
-                        end_pos = end_positions_audio[b].item()
-                        max_pos = min(end_pos, x.shape[2])
-                        if start_pos < max_pos:
-                            slice_from_perturbed_list.append(x[b:b+1, :, start_pos:max_pos])
-                        else:
-                            slice_from_perturbed_list.append(x[b:b+1, :, start_pos:start_pos+1])
-                    slice_from_perturbed = torch.cat(slice_from_perturbed_list, dim=0)  # [B, C, T_slice]
-                    
-                    # Encode both slices
-                    # In eval mode, encode() returns codes, not embeddings - get embeddings directly
+                    # Encode slice from original standalone
                     if self.training:
                         slice_original_frames = self.encode(slice_from_original)
-                        slice_perturbed_frames = self.encode(slice_from_perturbed)
                     else:
                         # In eval mode, get embeddings directly from encoder
-                        # Handle normalization if needed
                         slice_orig_frame = slice_from_original
-                        slice_pert_frame = slice_from_perturbed
                         if self.normalize:
                             mono_orig = slice_orig_frame.mean(dim=1, keepdim=True)
                             volume_orig = mono_orig.pow(2).mean(dim=2, keepdim=True).sqrt()
                             scale_orig = 1e-8 + volume_orig
                             slice_orig_frame = slice_orig_frame / scale_orig
                             scale_orig = scale_orig.view(-1, 1)
-                            
-                            mono_pert = slice_pert_frame.mean(dim=1, keepdim=True)
-                            volume_pert = mono_pert.pow(2).mean(dim=2, keepdim=True).sqrt()
-                            scale_pert = 1e-8 + volume_pert
-                            slice_pert_frame = slice_pert_frame / scale_pert
-                            scale_pert = scale_pert.view(-1, 1)
                         else:
                             scale_orig = None
-                            scale_pert = None
-                        # Get embeddings from encoder
                         emb_slice_orig = self.encoder(slice_orig_frame)  # [B, D, T]
-                        emb_slice_pert = self.encoder(slice_pert_frame)  # [B, D, T]
                         slice_original_frames = [(emb_slice_orig, scale_orig)]
-                        slice_perturbed_frames = [(emb_slice_pert, scale_pert)]
                     
-                    # Get features from both slices
-                    slice_original_features = {}
+                    # Extract corresponding slice from already-encoded full perturbed audio
+                    # This is Z_slice_from_full_perturbed: full perturbed encoded → extract slice from full encoding
+                    # full_features["quant_in"] is [B, D, T] where T is feature length
+                    # Extract slice using feature positions (start_positions_feature, end_positions_feature)
+                    full_quant_in = full_features["quant_in"]  # [B, D, T]
+                    full_quant_out = full_features["quant_out"]  # [B, D, T]
+                    
+                    # Extract slice from full encoding for each batch
                     slice_perturbed_features = {}
-                    slice_original_codebook_indices = []
-                    slice_perturbed_codebook_indices = []
-                    slice_original_sub_quants = []
-                    slice_perturbed_sub_quants = []
+                    for b in range(batch_size):
+                        start_feat = start_positions_feature[b].item()
+                        end_feat = end_positions_feature[b].item()
+                        # Extract from full encoding: [D, T] -> [D, T_slice]
+                        if b == 0:
+                            slice_perturbed_quant_in = full_quant_in[b:b+1, :, start_feat:end_feat]  # [1, D, T_slice]
+                            slice_perturbed_quant_out = full_quant_out[b:b+1, :, start_feat:end_feat]  # [1, D, T_slice]
+                        else:
+                            slice_perturbed_quant_in = torch.cat([
+                                slice_perturbed_quant_in, 
+                                full_quant_in[b:b+1, :, start_feat:end_feat]
+                            ], dim=0)
+                            slice_perturbed_quant_out = torch.cat([
+                                slice_perturbed_quant_out,
+                                full_quant_out[b:b+1, :, start_feat:end_feat]
+                            ], dim=0)
                     
-                    for (emb_slice_orig, scale_slice_orig), (emb_slice_pert, scale_slice_pert) in zip(slice_original_frames, slice_perturbed_frames):
+                    # Extract codebook indices from full encoding
+                    slice_perturbed_codebook_indices = []
+                    if full_codebook_indices is not None:
+                        # full_codebook_indices is [K, B, T]
+                        for b in range(batch_size):
+                            start_feat = start_positions_feature[b].item()
+                            end_feat = end_positions_feature[b].item()
+                            if b == 0:
+                                slice_perturbed_codes = full_codebook_indices[:, b:b+1, start_feat:end_feat]  # [K, 1, T_slice]
+                            else:
+                                slice_perturbed_codes = torch.cat([
+                                    slice_perturbed_codes,
+                                    full_codebook_indices[:, b:b+1, start_feat:end_feat]
+                                ], dim=1)
+                        slice_perturbed_codebook_indices.append(slice_perturbed_codes)  # [K, B, T_slice]
+                    
+                    # Extract sub_quants from full encoding if available
+                    slice_perturbed_sub_quants = []
+                    if len(full_sub_quants) > 0:
+                        full_sub_quants_t = full_sub_quants[0]  # [K, B, D, T]
+                        for b in range(batch_size):
+                            start_feat = start_positions_feature[b].item()
+                            end_feat = end_positions_feature[b].item()
+                            if b == 0:
+                                slice_perturbed_sub_quants_t = full_sub_quants_t[:, b:b+1, :, start_feat:end_feat]  # [K, 1, D, T_slice]
+                            else:
+                                slice_perturbed_sub_quants_t = torch.cat([
+                                    slice_perturbed_sub_quants_t,
+                                    full_sub_quants_t[:, b:b+1, :, start_feat:end_feat]
+                                ], dim=1)
+                        slice_perturbed_sub_quants.append(slice_perturbed_sub_quants_t)  # [K, B, D, T_slice]
+                    
+                    # Get features from original slice (encoded standalone)
+                    slice_original_features = {}
+                    slice_original_codebook_indices = []
+                    slice_original_sub_quants = []
+                    
+                    for emb_slice_orig, scale_slice_orig in slice_original_frames:
                         slice_original_features["quant_in"] = emb_slice_orig
-                        slice_perturbed_features["quant_in"] = emb_slice_pert
                         
-                        # Quantize both slices with same bandwidth
+                        # Quantize original slice with same bandwidth
                         qv_slice_orig = self.quantizer(emb_slice_orig, self.frame_rate, bw)
-                        qv_slice_pert = self.quantizer(emb_slice_pert, self.frame_rate, bw)
-                        
                         slice_original_features["quant_out"] = qv_slice_orig.quantized
-                        slice_perturbed_features["quant_out"] = qv_slice_pert.quantized
-                        
                         slice_original_codebook_indices.append(qv_slice_orig.codes)
-                        slice_perturbed_codebook_indices.append(qv_slice_pert.codes)
                         
-                        # Get sub_quants for both slices
-                        for emb_slice, qv_slice, sub_quants_list in [
-                            (emb_slice_orig, qv_slice_orig, slice_original_sub_quants),
-                            (emb_slice_pert, qv_slice_pert, slice_perturbed_sub_quants)
-                        ]:
-                            residual = emb_slice
-                            frame_sub_quants = []
-                            n_q_used = min(len(self.quantizer.vq.layers), qv_slice.codes.shape[0])
-                            for i in range(n_q_used):
-                                layer = self.quantizer.vq.layers[i]
-                                quantized, indices, layer_loss = layer(residual)
-                                frame_sub_quants.append(quantized)
-                                residual = residual - quantized.detach()
-                            if frame_sub_quants:
-                                sub_quants_list.append(torch.stack(frame_sub_quants))
+                        # Get sub_quants for original slice
+                        residual = emb_slice_orig
+                        frame_sub_quants = []
+                        n_q_used = min(len(self.quantizer.vq.layers), qv_slice_orig.codes.shape[0])
+                        for i in range(n_q_used):
+                            layer = self.quantizer.vq.layers[i]
+                            quantized, indices, layer_loss = layer(residual)
+                            frame_sub_quants.append(quantized)
+                            residual = residual - quantized.detach()
+                        if frame_sub_quants:
+                            slice_original_sub_quants.append(torch.stack(frame_sub_quants))
+                    
+                    # Set perturbed features (already extracted from full encoding)
+                    slice_perturbed_features["quant_in"] = slice_perturbed_quant_in  # [B, D, T_slice]
+                    slice_perturbed_features["quant_out"] = slice_perturbed_quant_out  # [B, D, T_slice]
                     
                     # Convert features to [B, T, D] format for consistency computation
                     # Slice from original audio features
