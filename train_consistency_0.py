@@ -16,7 +16,7 @@ import wandb
 import multi_dataset as data
 from multi_dataset import collate_fn
 from losses import disc_loss, total_loss
-from model_slice_consistency import EncodecModelWithSliceConsistency
+from model_consistency_0 import EncodecModelWithSliceConsistency
 from msstftd import MultiScaleSTFTDiscriminator
 from scheduler import WarmupCosineLrScheduler
 from utils import (count_parameters, save_master_checkpoint, set_seed)
@@ -230,14 +230,10 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
         'si_snr': [], 'count': 0
     })
     
-    # Track consistency accuracy metrics
-    slice_consistency_accuracies = defaultdict(list)  # Original full vs original slice
-    slice_consistency_first_codebook = defaultdict(list)
-    slice_consistency_first_3_codebooks = defaultdict(list)
+    # Track consistency accuracy metrics - CODEBOOK 0 ONLY
+    slice_consistency_codebook0 = defaultdict(list)  # Original full vs original slice (codebook 0 only)
     
-    augmentation_consistency_accuracies = defaultdict(list)  # Original full vs perturbed full
-    augmentation_consistency_first_codebook = defaultdict(list)
-    augmentation_consistency_first_3_codebooks = defaultdict(list)
+    augmentation_consistency_codebook0 = defaultdict(list)  # Original full vs perturbed full (codebook 0 only)
     
     for idx, input_wav in enumerate(valloader):
         if torch.cuda.is_available():
@@ -263,23 +259,15 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             total_loss_g += sum([l.item() for l in losses_g.values()])
             total_loss_disc += loss_disc.item()
             
-            # Extract consistency accuracy metrics if available
+            # Extract consistency accuracy metrics if available - CODEBOOK 0 ONLY
             if slice_consistency_output is not None:
-                # Slice consistency metrics (original full vs original slice)
-                if 'slice_consistency_accuracy' in slice_consistency_output:
-                    slice_consistency_accuracies[bandwidth].append(slice_consistency_output['slice_consistency_accuracy'])
+                # Slice consistency metrics (original full vs original slice) - codebook 0 only
                 if 'slice_consistency_codebook0_accuracy' in slice_consistency_output:
-                    slice_consistency_first_codebook[bandwidth].append(slice_consistency_output['slice_consistency_codebook0_accuracy'])
-                if 'slice_consistency_first_3_codebooks_accuracy' in slice_consistency_output:
-                    slice_consistency_first_3_codebooks[bandwidth].append(slice_consistency_output['slice_consistency_first_3_codebooks_accuracy'])
+                    slice_consistency_codebook0[bandwidth].append(slice_consistency_output['slice_consistency_codebook0_accuracy'])
                 
-                # Augmentation consistency metrics (original full vs perturbed full)
-                if 'augmentation_consistency_accuracy' in slice_consistency_output:
-                    augmentation_consistency_accuracies[bandwidth].append(slice_consistency_output['augmentation_consistency_accuracy'])
+                # Augmentation consistency metrics (original full vs perturbed full) - codebook 0 only
                 if 'augmentation_consistency_codebook0_accuracy' in slice_consistency_output:
-                    augmentation_consistency_first_codebook[bandwidth].append(slice_consistency_output['augmentation_consistency_codebook0_accuracy'])
-                if 'augmentation_consistency_first_3_codebooks_accuracy' in slice_consistency_output:
-                    augmentation_consistency_first_3_codebooks[bandwidth].append(slice_consistency_output['augmentation_consistency_first_3_codebooks_accuracy'])
+                    augmentation_consistency_codebook0[bandwidth].append(slice_consistency_output['augmentation_consistency_codebook0_accuracy'])
             
             # Calculate comprehensive metrics for each sample in batch
             batch_size = input_wav.shape[0]
@@ -319,37 +307,17 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
             si_snr_margin = (si_snr_ci_high - si_snr_ci_low) / 2
             logger.info(f"    SI-SNR: {si_snr_mean:.2f}±{si_snr_margin:.2f} dB")
             
-            # Log slice consistency accuracy metrics (original full vs original slice)
-            if bandwidth in slice_consistency_accuracies and len(slice_consistency_accuracies[bandwidth]) > 0:
-                slice_acc = slice_consistency_accuracies[bandwidth]
-                avg_slice = sum(slice_acc) / len(slice_acc)
-                logger.info(f"    Slice Consistency Accuracy: {avg_slice:.4f}")
-            
-            if bandwidth in slice_consistency_first_codebook and len(slice_consistency_first_codebook[bandwidth]) > 0:
-                slice_cb0 = slice_consistency_first_codebook[bandwidth]
+            # Log slice consistency accuracy metrics (original full vs original slice) - CODEBOOK 0 ONLY
+            if bandwidth in slice_consistency_codebook0 and len(slice_consistency_codebook0[bandwidth]) > 0:
+                slice_cb0 = slice_consistency_codebook0[bandwidth]
                 avg_slice_cb0 = sum(slice_cb0) / len(slice_cb0)
-                logger.info(f"    Slice Consistency First Codebook: {avg_slice_cb0:.4f}")
+                logger.info(f"    Slice Consistency Codebook 0: {avg_slice_cb0:.4f}")
             
-            if bandwidth in slice_consistency_first_3_codebooks and len(slice_consistency_first_3_codebooks[bandwidth]) > 0:
-                slice_3 = slice_consistency_first_3_codebooks[bandwidth]
-                avg_slice_3 = sum(slice_3) / len(slice_3)
-                logger.info(f"    Slice Consistency First 3 Codebooks: {avg_slice_3:.4f}")
-            
-            # Log augmentation consistency accuracy metrics (original full vs perturbed full)
-            if bandwidth in augmentation_consistency_accuracies and len(augmentation_consistency_accuracies[bandwidth]) > 0:
-                aug_acc = augmentation_consistency_accuracies[bandwidth]
-                avg_aug = sum(aug_acc) / len(aug_acc)
-                logger.info(f"    Augmentation Consistency Accuracy: {avg_aug:.4f}")
-            
-            if bandwidth in augmentation_consistency_first_codebook and len(augmentation_consistency_first_codebook[bandwidth]) > 0:
-                aug_cb0 = augmentation_consistency_first_codebook[bandwidth]
+            # Log augmentation consistency accuracy metrics (original full vs perturbed full) - CODEBOOK 0 ONLY
+            if bandwidth in augmentation_consistency_codebook0 and len(augmentation_consistency_codebook0[bandwidth]) > 0:
+                aug_cb0 = augmentation_consistency_codebook0[bandwidth]
                 avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
-                logger.info(f"    Augmentation Consistency First Codebook: {avg_aug_cb0:.4f}")
-            
-            if bandwidth in augmentation_consistency_first_3_codebooks and len(augmentation_consistency_first_3_codebooks[bandwidth]) > 0:
-                aug_3 = augmentation_consistency_first_3_codebooks[bandwidth]
-                avg_aug_3 = sum(aug_3) / len(aug_3)
-                logger.info(f"    Augmentation Consistency First 3 Codebooks: {avg_aug_3:.4f}")
+                logger.info(f"    Augmentation Consistency Codebook 0: {avg_aug_cb0:.4f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -370,37 +338,17 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_low'] = si_snr_ci_low
                 val_log_dict[f'val/si_snr_bw_{bandwidth}_ci_high'] = si_snr_ci_high
                 
-                # Log slice consistency accuracy metrics (original full vs original slice)
-                if bandwidth in slice_consistency_accuracies and len(slice_consistency_accuracies[bandwidth]) > 0:
-                    slice_acc = slice_consistency_accuracies[bandwidth]
-                    avg_slice = sum(slice_acc) / len(slice_acc)
-                    val_log_dict[f'val/slice_consistency_accuracy_bw_{bandwidth}'] = avg_slice
-                
-                if bandwidth in slice_consistency_first_codebook and len(slice_consistency_first_codebook[bandwidth]) > 0:
-                    slice_cb0 = slice_consistency_first_codebook[bandwidth]
+                # Log slice consistency accuracy metrics (original full vs original slice) - CODEBOOK 0 ONLY
+                if bandwidth in slice_consistency_codebook0 and len(slice_consistency_codebook0[bandwidth]) > 0:
+                    slice_cb0 = slice_consistency_codebook0[bandwidth]
                     avg_slice_cb0 = sum(slice_cb0) / len(slice_cb0)
                     val_log_dict[f'val/slice_consistency_codebook0_bw_{bandwidth}'] = avg_slice_cb0
                 
-                if bandwidth in slice_consistency_first_3_codebooks and len(slice_consistency_first_3_codebooks[bandwidth]) > 0:
-                    slice_3 = slice_consistency_first_3_codebooks[bandwidth]
-                    avg_slice_3 = sum(slice_3) / len(slice_3)
-                    val_log_dict[f'val/slice_consistency_first_3_codebooks_bw_{bandwidth}'] = avg_slice_3
-                
-                # Log augmentation consistency accuracy metrics (original full vs perturbed full)
-                if bandwidth in augmentation_consistency_accuracies and len(augmentation_consistency_accuracies[bandwidth]) > 0:
-                    aug_acc = augmentation_consistency_accuracies[bandwidth]
-                    avg_aug = sum(aug_acc) / len(aug_acc)
-                    val_log_dict[f'val/augmentation_consistency_accuracy_bw_{bandwidth}'] = avg_aug
-                
-                if bandwidth in augmentation_consistency_first_codebook and len(augmentation_consistency_first_codebook[bandwidth]) > 0:
-                    aug_cb0 = augmentation_consistency_first_codebook[bandwidth]
+                # Log augmentation consistency accuracy metrics (original full vs perturbed full) - CODEBOOK 0 ONLY
+                if bandwidth in augmentation_consistency_codebook0 and len(augmentation_consistency_codebook0[bandwidth]) > 0:
+                    aug_cb0 = augmentation_consistency_codebook0[bandwidth]
                     avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
                     val_log_dict[f'val/augmentation_consistency_codebook0_bw_{bandwidth}'] = avg_aug_cb0
-                
-                if bandwidth in augmentation_consistency_first_3_codebooks and len(augmentation_consistency_first_3_codebooks[bandwidth]) > 0:
-                    aug_3 = augmentation_consistency_first_3_codebooks[bandwidth]
-                    avg_aug_3 = sum(aug_3) / len(aug_3)
-                    val_log_dict[f'val/augmentation_consistency_first_3_codebooks_bw_{bandwidth}'] = avg_aug_3
         
         wandb_logger.log(val_log_dict)
 
@@ -411,7 +359,7 @@ def train(config):
     logger.handlers.clear()
 
     # Set up logging
-    file_handler = logging.FileHandler(f"{config.checkpoint.save_folder}/train_slice_consistency_bs{config.datasets.batch_size}_lr{config.optimization.lr}.log")
+    file_handler = logging.FileHandler(f"{config.checkpoint.save_folder}/train_consistency_0_bs{config.datasets.batch_size}_lr{config.optimization.lr}.log")
     formatter = logging.Formatter('%(asctime)s: %(levelname)s: [%(filename)s: %(lineno)d]: %(message)s')
     file_handler.setFormatter(formatter)
 
@@ -429,8 +377,8 @@ def train(config):
     if config.get('wandb', {}).get('enabled', True):
         try:
             wandb.init(
-                project=config.get('wandb', {}).get('project', 'multi-dataset-encodec-slice-consistency'),
-                name=config.get('wandb', {}).get('name', f'slice_consistency_bs{config.datasets.batch_size}_lr{config.optimization.lr}'),
+                project=config.get('wandb', {}).get('project', 'multi-dataset-encodec-consistency-0'),
+                name=config.get('wandb', {}).get('name', f'consistency_0_bs{config.datasets.batch_size}_lr{config.optimization.lr}'),
                 config=dict(config),
                 dir=config.checkpoint.save_folder,
             )
@@ -630,7 +578,7 @@ def train(config):
             
             # Log model artifacts to wandb
             if wandb_logger:
-                artifact = wandb.Artifact(f'slice_consistency_model_epoch_{epoch}', type='model')
+                artifact = wandb.Artifact(f'consistency_0_model_epoch_{epoch}', type='model')
                 artifact.add_file(model_path)
                 artifact.add_file(disc_path)
                 wandb_logger.log_artifact(artifact)
@@ -663,7 +611,7 @@ def train(config):
         wandb.finish()
 
 
-@hydra.main(config_path='config', config_name='config_slice_consistency')
+@hydra.main(config_path='config', config_name='config_consistency_0')
 def main(config):
     # Disable cudnn
     torch.backends.cudnn.enabled = False

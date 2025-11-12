@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Multi-dataset EnCodec training script with slice consistency
+# Multi-dataset EnCodec training script with codebook 0 consistency
 # This script runs training with multiple datasets (jamendo, common_voice, etc.)
-# and includes slice consistency loss
+# and includes consistency losses for codebook 0 (augmentation and slice consistency)
 
-echo "Starting multi-dataset EnCodec training with slice consistency..."
+echo "Starting multi-dataset EnCodec training with codebook 0 consistency..."
 echo "Target bandwidths: 1.5, 3.0, 6.0, 12.0, 24.0 kbps"
 
 # Check if virtual environment exists
@@ -31,12 +31,12 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Create output directory if it doesn't exist
-mkdir -p ./checkpoints_multi_dataset_slice_consistency/
+mkdir -p ./checkpoints_multi_dataset_consistency_0/
 
 # Run training
-echo "Starting training with slice consistency..."
-python train_slice_consistency.py \
-    --config-name=config_slice_consistency \
+echo "Starting training with codebook 0 consistency..."
+python train_consistency_0.py \
+    --config-name=config_consistency_0 \
     common.max_epoch=400 \
     datasets.batch_size=16 \
     datasets.fixed_length=32000 \
@@ -51,7 +51,7 @@ python train_slice_consistency.py \
     model.perturb_encoder.perturb_all_audio=true \
     model.perturb_encoder.perturb_slice_audio=true \
     wandb.enabled=true \
-    wandb.project=multi-dataset-encodec-slice-consistency \
-    wandb.name=multi_dataset_slice_consistency_bs16_epochs400_24khz_mono
+    wandb.project=multi-dataset-encodec-consistency-0 \
+    wandb.name=multi_dataset_consistency_0_bs16_epochs400_24khz_mono
 
 echo "Training completed!"

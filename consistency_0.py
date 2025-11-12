@@ -494,3 +494,110 @@ class SliceConsistency(nn.Module):
             augmentation_accuracies['augmentation_consistency_first_3_codebooks_accuracy'] = sum(first_3_accs) / 3.0
         
         return augmentation_accuracies
+    
+    def compute_augmentation_constraint_loss(
+        self,
+        original_first_codebook: torch.Tensor,
+        perturbed_first_codebook: torch.Tensor,
+        original_first_codebook_indices: tp.Optional[torch.Tensor] = None,
+        perturbed_first_codebook_indices: tp.Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute augmentation constraint loss using only first codebook (Q1).
+        
+        This loss ensures that gain/invert augmentations produce the same Q1(e1) = x1
+        for the whole audio whether you add gain (any gain) or invert the audio.
+        
+        We compare the quantized vectors (embeddings) which use straight-through estimator,
+        so gradients flow back through the encoder outputs.
+        
+        Args:
+            original_first_codebook: First codebook quantized embeddings from original audio [B, D, T]
+            perturbed_first_codebook: First codebook quantized embeddings from perturbed audio [B, D, T]
+            original_first_codebook_indices: Optional first codebook indices from original audio [B, T]
+            perturbed_first_codebook_indices: Optional first codebook indices from perturbed audio [B, T]
+            
+        Returns:
+            MSE loss between original and perturbed first codebook embeddings [scalar tensor]
+            Note: Uses straight-through estimator, so gradients flow back through encoder
+        """
+        device = original_first_codebook.device
+        
+        # Ensure shapes match (use minimum length if they differ)
+        B, D, T_orig = original_first_codebook.shape
+        _, _, T_pert = perturbed_first_codebook.shape
+        min_T = min(T_orig, T_pert)
+        
+        orig_q1 = original_first_codebook[:, :, :min_T]  # [B, D, T]
+        pert_q1 = perturbed_first_codebook[:, :, :min_T]  # [B, D, T]
+        
+        # Compute MSE loss on quantized vectors
+        # The quantized vectors use straight-through estimator: quantize = x + (quantize - x).detach()
+        # So gradients flow back through x (encoder output), not through the codebook lookup
+        diff = orig_q1 - pert_q1
+        mse = diff ** 2  # [B, D, T]
+        
+        # Mean over all dimensions
+        loss = mse.mean()
+        
+        return loss
+    
+    def compute_slice_consistency_constraint_loss(
+        self,
+        full_first_codebook: torch.Tensor,
+        slice_first_codebook: torch.Tensor,
+        slice_interval: SliceInterval,
+        full_first_codebook_indices: tp.Optional[torch.Tensor] = None,
+        slice_first_codebook_indices: tp.Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute slice consistency constraint loss using only first codebook (Q1).
+        
+        This loss ensures that slices with or without context produce the same Q1(e1) = x1.
+        We take whole original audio, find x1, then find corresponding x1 for the slice timestamps.
+        Then we cut the audio at slice timestamps and encode. These two x1 should be the same.
+        
+        We compare the quantized vectors (embeddings) which use straight-through estimator,
+        so gradients flow back through the encoder outputs.
+        
+        Args:
+            full_first_codebook: First codebook quantized embeddings from full audio [B, D, T]
+            slice_first_codebook: First codebook quantized embeddings from slice (cut and encoded standalone) [B, D, T_slice]
+            slice_interval: SliceInterval with alignment information
+            full_first_codebook_indices: Optional first codebook indices from full audio [B, T]
+            slice_first_codebook_indices: Optional first codebook indices from slice [B, T_slice]
+            
+        Returns:
+            MSE loss between full and slice first codebook embeddings at overlapping positions [scalar tensor]
+            Note: Uses straight-through estimator, so gradients flow back through encoder
+        """
+        device = full_first_codebook.device
+        
+        # Convert to [B, T, D] format for alignment
+        full_q1 = full_first_codebook.transpose(1, 2)  # [B, T, D]
+        slice_q1 = slice_first_codebook.transpose(1, 2)  # [B, T_slice, D]
+        
+        # Gather features from full audio at overlapping positions with slice
+        gathered_features, aligned_slice_features, attention_mask = self.gather_features(
+            full_q1, slice_q1, slice_interval
+        )
+        
+        # Compute MSE loss on quantized vectors
+        # The quantized vectors use straight-through estimator: quantize = x + (quantize - x).detach()
+        # So gradients flow back through x (encoder output), not through the codebook lookup
+        diff = gathered_features - aligned_slice_features  # [B, T, D]
+        mse = diff ** 2
+        
+        # Apply attention mask
+        attention_mask_expanded = attention_mask.unsqueeze(-1).type_as(mse)  # [B, T, 1]
+        mse = mse * attention_mask_expanded
+        
+        # Compute total valid elements
+        tot = attention_mask.sum()
+        
+        if self.mse_loss_reduction == "mean":
+            loss = mse.sum() / tot / mse.shape[-1]  # Divide by valid elements and feature dim
+        elif self.mse_loss_reduction == "sum":
+            loss = mse.sum()
+        else:
+            raise ValueError(f"Unknown mse_loss_reduction: {self.mse_loss_reduction}")
+        
+        return loss
