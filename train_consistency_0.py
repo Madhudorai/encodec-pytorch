@@ -5,6 +5,7 @@ from collections import defaultdict
 import random
 from pathlib import Path
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import hydra
 import torch
@@ -573,38 +574,65 @@ def train(config):
             model_path = f'{config.checkpoint.save_location}epoch{epoch}_lr{config.optimization.lr}.pt'
             disc_path = f'{config.checkpoint.save_location}epoch{epoch}_disc_lr{config.optimization.lr}.pt'
             
-            save_master_checkpoint(epoch, model, optimizer, scheduler, model_path)  
-            save_master_checkpoint(epoch, disc_model, optimizer_disc, disc_scheduler, disc_path)
+            try:
+                save_master_checkpoint(epoch, model, optimizer, scheduler, model_path)  
+                save_master_checkpoint(epoch, disc_model, optimizer_disc, disc_scheduler, disc_path)
+                logger.info(f"✓ Saved checkpoints for epoch {epoch}")
+            except Exception as e:
+                logger.error(f"❌ Failed to save checkpoints for epoch {epoch}: {e}")
+                raise  # Re-raise to stop training if checkpoint saving fails
             
-            # Log model artifacts to wandb
-            if wandb_logger:
-                artifact = wandb.Artifact(f'consistency_0_model_epoch_{epoch}', type='model')
-                artifact.add_file(model_path)
-                artifact.add_file(disc_path)
-                wandb_logger.log_artifact(artifact)
+            # Log model artifacts to wandb (with timeout to prevent hanging)
+            # Skip artifact upload if disabled in config or if upload fails/times out
+            upload_artifacts = config.get('wandb', {}).get('upload_artifacts', True)
+            if wandb_logger and upload_artifacts:
+                try:
+                    artifact = wandb.Artifact(f'consistency_0_model_epoch_{epoch}', type='model')
+                    
+                    # CRITICAL: Wrap add_file in timeout - file I/O can hang on network filesystems
+                    # artifact.add_file() reads files from disk and can block indefinitely
+                    def add_files_to_artifact():
+                        artifact.add_file(model_path)
+                        artifact.add_file(disc_path)
+                    
+                    # Use thread pool with timeout for file I/O (reading checkpoints)
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future_add = executor.submit(add_files_to_artifact)
+                        try:
+                            future_add.result(timeout=60)  # 1 minute timeout for file I/O
+                            logger.info(f"✓ Added checkpoint files to artifact for epoch {epoch}")
+                        except FutureTimeoutError:
+                            logger.warning(f"⚠ Adding files to artifact timed out for epoch {epoch} (file I/O hang). Skipping upload...")
+                            future_add.cancel()
+                            raise  # Re-raise to skip upload
+                        except Exception as e:
+                            logger.warning(f"⚠ Failed to add files to artifact for epoch {epoch}: {e}. Skipping upload...")
+                            raise  # Re-raise to skip upload
+                    
+                    # Use thread pool with timeout to prevent blocking indefinitely on network upload
+                    # Timeout: 300 seconds (5 minutes) - adjust if checkpoints are very large
+                    def upload_artifact():
+                        wandb_logger.log_artifact(artifact)
+                    
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(upload_artifact)
+                        try:
+                            future.result(timeout=300)  # 5 minute timeout
+                            logger.info(f"✓ Successfully uploaded wandb artifact for epoch {epoch}")
+                        except FutureTimeoutError:
+                            logger.warning(f"⚠ Wandb artifact upload timed out for epoch {epoch} (exceeded 5 minutes). Continuing training...")
+                            # Cancel the future (though it may continue in background)
+                            future.cancel()
+                        except Exception as e:
+                            logger.warning(f"⚠ Wandb artifact upload failed for epoch {epoch}: {e}. Continuing training...")
+                except Exception as e:
+                    logger.warning(f"⚠ Failed to create/upload wandb artifact for epoch {epoch}: {e}. Continuing training...")
+            elif wandb_logger and not upload_artifacts:
+                logger.info(f"Skipping wandb artifact upload for epoch {epoch} (disabled in config - checkpoints saved locally only)")
             
-            # Delete previous epoch's checkpoints to save space (keep only latest locally)
-            # Since everything is logged to wandb, we only need the most recent checkpoint for resuming
-            prev_epoch = epoch - config.common.save_interval
-            if prev_epoch > 0 and prev_epoch % config.common.save_interval == 0:
-                prev_model_path = f'{config.checkpoint.save_location}epoch{prev_epoch}_lr{config.optimization.lr}.pt'
-                prev_disc_path = f'{config.checkpoint.save_location}epoch{prev_epoch}_disc_lr{config.optimization.lr}.pt'
-                
-                # Delete previous model checkpoint if it exists
-                if os.path.exists(prev_model_path):
-                    try:
-                        os.remove(prev_model_path)
-                        logger.info(f"Deleted previous checkpoint: {prev_model_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {prev_model_path}: {e}")
-                
-                # Delete previous discriminator checkpoint if it exists
-                if os.path.exists(prev_disc_path):
-                    try:
-                        os.remove(prev_disc_path)
-                        logger.info(f"Deleted previous checkpoint: {prev_disc_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {prev_disc_path}: {e}")
+            # Keep all checkpoints locally - no deletion
+            # All checkpoints are saved in: {config.checkpoint.save_folder}/
+            logger.info(f"Checkpoints saved locally for epoch {epoch} (keeping all checkpoints, no deletion)")
     
     # Finish wandb run
     if wandb_logger:

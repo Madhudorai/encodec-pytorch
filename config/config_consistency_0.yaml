@@ -101,3 +101,4 @@ wandb:
   enabled: True
   project: 'multi-dataset-encodec-consistency-0'
   name: 'multi_dataset_consistency_0_bs16_epochs400_24khz_mono'
+  upload_artifacts: False   

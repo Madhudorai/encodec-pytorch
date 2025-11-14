@@ -139,13 +139,16 @@ def save_master_checkpoint(epoch, model, optimizer, scheduler, ckpt_name):
         scheduler (_type_): _description_
         ckpt_name (str): checkpoint name
     """
-    state_dict = {  
-        'epoch': epoch,  
-        'model_state_dict': model.state_dict(),  
-        'optimizer_state_dict': optimizer.state_dict(),  
-        'scheduler_state_dict': scheduler.state_dict(),  
-    }  
-    torch.save(state_dict, ckpt_name) 
+    try:
+        state_dict = {  
+            'epoch': epoch,  
+            'model_state_dict': model.state_dict(),  
+            'optimizer_state_dict': optimizer.state_dict(),  
+            'scheduler_state_dict': scheduler.state_dict(),  
+        }  
+        torch.save(state_dict, ckpt_name)
+    except Exception as e:
+        raise RuntimeError(f"Failed to save checkpoint {ckpt_name}: {e}") 
 
 def start_dist_train(train_fn, world_size, config, dist_init_method=None):  
     """start distribustion training
