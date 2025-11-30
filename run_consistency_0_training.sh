@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Multi-dataset EnCodec training script with codebook 0 consistency
-# This script runs training with multiple datasets (jamendo, common_voice, etc.)
+# Eigenscape EnCodec training script with codebook 0 consistency
+# This script runs training with Eigenscape multi-channel dataset
 # and includes consistency losses for codebook 0 (augmentation and slice consistency)
 
-echo "Starting multi-dataset EnCodec training with codebook 0 consistency..."
+echo "Starting Eigenscape EnCodec training with codebook 0 consistency..."
 echo "Target bandwidths: 1.5, 3.0, 6.0, 12.0, 24.0 kbps"
 
 # Check if virtual environment exists
@@ -31,27 +31,30 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Create output directory if it doesn't exist
-mkdir -p ./checkpoints_multi_dataset_consistency_0/
+mkdir -p ./checkpoints_eigenscape_consistency_0/
 
 # Run training
 echo "Starting training with codebook 0 consistency..."
 python train_consistency_0.py \
     --config-name=config_consistency_0 \
-    common.max_epoch=400 \
-    datasets.batch_size=16 \
-    datasets.fixed_length=32000 \
+    common.max_epoch=200 \
+    common.val_interval=5 \
+    datasets.batch_size=8 \
+    datasets.fixed_length=16000 \
     model.sample_rate=24000 \
-    model.channels=1 \
+    model.channels=2 \
     model.target_bandwidths=[1.5,3.0,6.0,12.0,24.0] \
     model.slice_consistency.slice_interval_type=random \
     model.slice_consistency.split_interval_percentage=0.2 \
     model.slice_consistency.feature_types=["quant_in"] \
-    model.slice_consistency.loss_weights=[20.0] \
     model.perturb_encoder.perturb_methods=["volume_aug","inversion_aug"] \
+    model.perturb_encoder.volume_aug_config.gain_range=[0.5,2.0] \
+    model.perturb_encoder.volume_aug_config.apply_prob=0.5 \
+    model.perturb_encoder.inversion_aug_config.apply_prob=0.5 \
     model.perturb_encoder.perturb_all_audio=true \
     model.perturb_encoder.perturb_slice_audio=true \
     wandb.enabled=true \
-    wandb.project=multi-dataset-encodec-consistency-0 \
-    wandb.name=multi_dataset_consistency_0_bs16_epochs400_24khz_mono
+    wandb.project=eigenscape-encodec-consistency-0 \
+    wandb.name=eigenscape_consistency_0_bs8_epochs200_24khz
 
 echo "Training completed!"

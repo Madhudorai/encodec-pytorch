@@ -1,4 +1,4 @@
-"""EnCodec model with slice consistency support."""
+"""EnCodec model with consistency losses for Eigenscape dataset."""
 
 import math
 from pathlib import Path
@@ -45,6 +45,8 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         slice_consistency: tp.Optional[dict] = None,
         # Perturbation parameters
         perturb_encoder: tp.Optional[dict] = None,
+        # Inter-channel consistency parameters
+        inter_channel_consistency: tp.Optional[dict] = None,
     ):
         super().__init__(
             encoder, decoder, quantizer, target_bandwidths,
@@ -53,17 +55,80 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         
         # Initialize slice consistency module
         if slice_consistency is not None:
-            self.slice_consistency = SliceConsistency(**slice_consistency)
+            # Extract weights for constraint losses before passing to SliceConsistency
+            self.augmentation_constraint_loss_weight = slice_consistency.get('augmentation_constraint_loss_weight', 15.0)
+            self.slice_consistency_constraint_loss_weight = slice_consistency.get('slice_consistency_constraint_loss_weight', 15.0)
+            # Remove these from slice_consistency dict before passing to SliceConsistency
+            slice_consistency_for_init = {k: v for k, v in slice_consistency.items() 
+                                         if k not in ['augmentation_constraint_loss_weight', 'slice_consistency_constraint_loss_weight']}
+            self.slice_consistency = SliceConsistency(**slice_consistency_for_init)
             self.use_slice_consistency = True
         else:
             self.slice_consistency = None
             self.use_slice_consistency = False
+            self.augmentation_constraint_loss_weight = 15.0
+            self.slice_consistency_constraint_loss_weight = 15.0
         
         # Initialize perturb encoder
         if perturb_encoder is not None:
             self.perturb_encoder = PerturbEncoder(**perturb_encoder)
         else:
             self.perturb_encoder = None
+        
+        # Initialize inter-channel consistency
+        if inter_channel_consistency is not None and inter_channel_consistency.get('enabled', False):
+            self.inter_channel_consistency = inter_channel_consistency
+            self.use_inter_channel_consistency = True
+        else:
+            self.inter_channel_consistency = None
+            self.use_inter_channel_consistency = False
+    
+    def _quantize_from_codebook(self, emb: torch.Tensor, sample_rate: int, bandwidth: float, start_codebook: int = 1):
+        """Quantize embeddings starting from a specific codebook index.
+        
+        Args:
+            emb: Encoder embeddings [B, D, T]
+            sample_rate: Sample rate
+            bandwidth: Target bandwidth
+            start_codebook: Codebook index to start from (0-indexed, default 1 to skip codebook 0)
+            
+        Returns:
+            QuantizedResult with quantized embeddings, codes, and loss
+        """
+        from quantization.vq import QuantizedResult
+        
+        bw_per_q = self.quantizer.get_bandwidth_per_quantizer(sample_rate)
+        n_q_total = self.quantizer.get_num_quantizers_for_bandwidth(sample_rate, bandwidth)
+        
+        # Only use codebooks from start_codebook onwards
+        n_q_used = max(1, n_q_total - start_codebook)  # At least 1 codebook
+        
+        # Manually quantize starting from start_codebook
+        residual = emb
+        quantized_out = torch.zeros_like(emb)
+        all_indices = []
+        all_losses = []
+        
+        for i in range(start_codebook, start_codebook + n_q_used):
+            if i >= len(self.quantizer.vq.layers):
+                break
+            layer = self.quantizer.vq.layers[i]
+            quantized, indices, loss = layer(residual)
+            residual = residual - quantized.detach()
+            quantized_out = quantized_out + quantized
+            all_indices.append(indices)
+            all_losses.append(loss)
+        
+        if all_indices:
+            out_indices = torch.stack(all_indices)  # [n_q_used, B, T]
+            out_losses = torch.stack(all_losses)
+            commit_loss = torch.mean(out_losses)
+            bw = torch.tensor(n_q_used * bw_per_q).to(emb)
+            return QuantizedResult(quantized_out, out_indices, bw, penalty=commit_loss)
+        else:
+            # Fallback: return unquantized
+            dummy_indices = torch.zeros((1, emb.shape[0], emb.shape[2]), dtype=torch.long, device=emb.device)
+            return QuantizedResult(emb, dummy_indices, torch.tensor(0.0).to(emb), penalty=torch.tensor(0.0).to(emb))
     
     def forward(
         self, 
@@ -75,7 +140,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         """Forward pass with optional slice consistency computation.
         
         Args:
-            x: Input audio tensor [B, C, T]
+            x: Input audio tensor [B, C, T] where C can be > 1 for multi-channel
             return_embeddings: Whether to return intermediate embeddings
             return_slice_consistency: Whether to compute slice consistency loss
             
@@ -88,17 +153,21 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                 - output: Reconstructed audio [B, C, T]
                 - loss_w: Commitment loss
                 - frames: Encoded frames
-                - slice_consistency_output: Dictionary with slice consistency loss
+                - slice_consistency_output: Dictionary with slice consistency loss (includes intra and inter-channel)
         """
-        # FORWARD PASS FLOW:
-        # 1. If slice consistency is enabled: Store original audio for slice extraction
-        #    (We extract slice from original audio, then augment it independently)
-        # 2. Augment full audio if enabled (for slice consistency on augmented audio)
-        # 3. Encode augmented full audio -> get features
-        # 4. Extract slice from original (unperturbed) audio
-        # 5. Augment slice independently if enabled
-        # 6. Encode augmented slice -> get features  
-        # 7. Compute slice consistency between full and slice features
+        # Check if we have multi-channel input (C > 1)
+        B, C, T = x.shape
+        is_multi_channel = C > 1
+        
+        # For multi-channel, reshape to process each channel separately
+        # [B, C, T] -> [B*C, 1, T]
+        # NOTE: We do separate forward passes because encoding is NOT context-independent.
+        # If we concatenated channels in time [B, 1, 2*T], the encoding of [T-2T] would be
+        # affected by the audio in [0-T], which would break inter-channel consistency.
+        if is_multi_channel:
+            x_reshaped = x.reshape(B * C, 1, T)  # [B*C, 1, T]
+        else:
+            x_reshaped = x
         
         # Store original audio if we need it for slice extraction or augmentation consistency
         # We need it if: slice consistency is enabled AND we're perturbing full audio
@@ -110,7 +179,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
             self.perturb_encoder is not None and 
             self.perturb_encoder.perturb_all_audio
         )
-        orig_audio = x.clone() if need_original else None
+        orig_audio = x_reshaped.clone() if need_original else None
         
         # Compute original codebook indices for augmentation consistency (before perturbation)
         # We'll compute this after we know the bandwidth (in training/eval mode)
@@ -120,21 +189,23 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         # When slice consistency is enabled, we want to calculate consistency on augmented audio
         # So if perturb_all_audio is True, we always augment the full audio
         # (Individual augmentations have their own apply_prob for probabilistic application)
+        # For multi-channel, apply perturbations per-channel (each channel gets independent perturbations)
         if self.perturb_encoder is not None and self.perturb_encoder.perturb_all_audio:
             # Only create sample indices for deterministic behavior (validation), skip in training for speed
             if batch_idx is not None:
-                batch_size = x.shape[0]
-                sample_indices = torch.arange(batch_size, device=x.device)
-                x = self.perturb_encoder(x, batch_idx=batch_idx, sample_indices=sample_indices)
+                batch_size = x_reshaped.shape[0]
+                sample_indices = torch.arange(batch_size, device=x_reshaped.device)
+                x_reshaped = self.perturb_encoder(x_reshaped, batch_idx=batch_idx, sample_indices=sample_indices)
             else:
                 # Training mode: use simple call without extra parameters (faster)
-                x = self.perturb_encoder(x)
+                # Each channel gets independent perturbations
+                x_reshaped = self.perturb_encoder(x_reshaped)
         
-        frames = self.encode(x)
+        frames = self.encode(x_reshaped)
         
         if self.training:
             # Standard training forward
-            loss_w = torch.tensor([0.0], device=x.device, requires_grad=True)
+            loss_w = torch.tensor([0.0], device=x_reshaped.device, requires_grad=True)
             codes = []
             quantized_embeddings = []
             
@@ -143,6 +214,12 @@ class EncodecModelWithSliceConsistency(EncodecModel):
             if torch.distributed.is_initialized():
                 torch.distributed.broadcast(index, src=0)
             bw = self.target_bandwidths[index.item()]
+            
+            # Extract codebook 0 indices for inter-channel consistency
+            # We'll extract from full_codebook_indices after the main forward pass
+            # to avoid redundant forward passes
+            inter_channel_cb0_indices = None
+            # Will be set after we get full_codebook_indices from main forward pass
             
             # Compute original codebook indices for augmentation consistency (before perturbation)
             # Use the same bandwidth as perturbed audio
@@ -197,7 +274,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                 if "quant_in" not in full_features:
                     full_features["quant_in"] = emb  # [B, D, T]
                 
-                # Quantize
+                # Normal quantization (all codebooks including 0)
                 qv = self.quantizer(emb, self.frame_rate, bw)
                 loss_w = loss_w + qv.penalty
                 codes.append((qv.quantized, scale))
@@ -222,10 +299,25 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         frame_sub_quants.append(quantized)
                         residual = residual - quantized.detach()
                     if frame_sub_quants:
-                        full_sub_quants.append(torch.stack(frame_sub_quants))  # [K, B, D, T]
+                        full_sub_quants.append(torch.stack(frame_sub_quants))  # [K, B*C, D, T] (after reshape)
             
             # Decode full audio
-            output = self.decode(codes)[:, :, :x.shape[-1]]
+            output = self.decode(codes)[:, :, :x_reshaped.shape[-1]]
+            
+            # Reshape output back to [B, C, T] if multi-channel
+            if is_multi_channel:
+                output = output.reshape(B, C, output.shape[-1])  # [B, C, T]
+                
+                # Extract inter-channel codebook 0 indices from full_codebook_indices
+                # full_codebook_indices is [K, B*C, T_feat] where:
+                # - First B samples (0 to B-1) are channel 0
+                # - Next B samples (B to 2B-1) are channel 1
+                if self.use_inter_channel_consistency and C == 2 and full_codebook_indices is not None:
+                    # Extract codebook 0 (first codebook) indices
+                    cb0_indices = full_codebook_indices[0]  # [B*C, T_feat]
+                    ch0_cb0_indices = cb0_indices[:B, :]  # [B, T_feat] - channel 0
+                    ch1_cb0_indices = cb0_indices[B:, :]  # [B, T_feat] - channel 1
+                    inter_channel_cb0_indices = (ch0_cb0_indices, ch1_cb0_indices)
             
             # Compute slice consistency if requested (allow in eval mode for validation metrics)
             slice_consistency_output = None
@@ -271,29 +363,52 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     # Convert feature positions to audio positions
                     start_positions_audio = start_positions_feature * ds_rate
                     end_positions_audio = end_positions_feature * ds_rate
-                    audio_length = x.shape[2]  # [B, C, T]
+                    # For separate channel processing, each channel has its own T samples
+                    # batch_size here is B*C (from reshaped [B*C, 1, T])
+                    # We need to extract slices from original x [B, C, T] format
+                    # and ensure slices stay within each channel's boundary (0-T for each channel)
+                    audio_length = T  # Each channel has T samples
                     end_positions_audio = torch.clamp(end_positions_audio, max=audio_length)
                     
                     # Extract the SAME slice from both original and perturbed full audio
                     # This aligns latent representations from slice-consistency and perturbation-consistency methods
+                    # IMPORTANT: For separate channel processing [B*C, 1, T], we extract slices
+                    # from the original x [B, C, T] format, ensuring slices stay within [0, T] for each channel
                     
-                    # Extract slice from original full audio
+                    # batch_size is B*C, so we need to map back to [B, C, T] format
+                    # For each sample in batch, extract slice from its corresponding channel
+                    if orig_audio is not None:
+                        # orig_audio is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
+                        orig_audio_reshaped = orig_audio.reshape(B, C, T)  # [B, C, T]
+                    else:
+                        orig_audio_reshaped = x  # [B, C, T]
+                    
+                    # x_reshaped is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
+                    x_reshaped_back = x_reshaped.reshape(B, C, T)  # [B, C, T]
+                    
+                    # Extract slice from original full audio [B, C, T]
                     slice_from_original_list = []
-                    for b in range(batch_size):
-                        start_pos = start_positions_audio[b].item()
-                        end_pos = end_positions_audio[b].item()
-                        # Use original audio if available, otherwise use x (which might be perturbed)
-                        source_orig = orig_audio if orig_audio is not None else x
-                        slice_from_original_list.append(source_orig[b:b+1, :, start_pos:end_pos])
-                    slice_from_original = torch.cat(slice_from_original_list, dim=0)  # [B, C, T_slice]
+                    for bc_idx in range(batch_size):
+                        # Map bc_idx back to (b, c)
+                        b = bc_idx // C
+                        c = bc_idx % C
+                        start_pos = start_positions_audio[bc_idx].item()
+                        end_pos = end_positions_audio[bc_idx].item()
+                        # Extract slice from channel c of batch b
+                        slice_from_original_list.append(orig_audio_reshaped[b:b+1, c:c+1, start_pos:end_pos])
+                    slice_from_original = torch.cat(slice_from_original_list, dim=0)  # [B*C, 1, T_slice]
                     
                     # Extract the SAME slice from perturbed full audio
                     slice_from_perturbed_list = []
-                    for b in range(batch_size):
-                        start_pos = start_positions_audio[b].item()
-                        end_pos = end_positions_audio[b].item()
-                        slice_from_perturbed_list.append(x[b:b+1, :, start_pos:end_pos])
-                    slice_from_perturbed = torch.cat(slice_from_perturbed_list, dim=0)  # [B, C, T_slice]
+                    for bc_idx in range(batch_size):
+                        # Map bc_idx back to (b, c)
+                        b = bc_idx // C
+                        c = bc_idx % C
+                        start_pos = start_positions_audio[bc_idx].item()
+                        end_pos = end_positions_audio[bc_idx].item()
+                        # Extract slice from channel c of batch b
+                        slice_from_perturbed_list.append(x_reshaped_back[b:b+1, c:c+1, start_pos:end_pos])
+                    slice_from_perturbed = torch.cat(slice_from_perturbed_list, dim=0)  # [B*C, 1, T_slice]
                     
                     # Encode both slices
                     slice_original_frames = self.encode(slice_from_original)
@@ -383,10 +498,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         split_interval_lengths=slice_feature_lengths,
                     )
                     
-                    # Compute two constraint losses using only first codebook (Q1)
-                    # 1. Augmentation constraint loss: original full vs perturbed full
-                    # 2. Slice consistency constraint loss: original full vs original slice
-                    
+                    # Compute consistency losses using codebook 0 only
                     # Initialize output dictionary
                     slice_consistency_output = {
                         'loss': torch.tensor(0.0, device=emb.device, requires_grad=True),
@@ -452,10 +564,12 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     # Compute augmentation constraint loss: original full vs perturbed full
                     loss_augmentation_constraint = None
                     if original_full_q1 is not None and perturbed_full_q1 is not None:
-                        loss_augmentation_constraint = self.slice_consistency.compute_augmentation_constraint_loss(
+                        loss_augmentation_constraint_raw = self.slice_consistency.compute_augmentation_constraint_loss(
                             original_first_codebook=original_full_q1,
                             perturbed_first_codebook=perturbed_full_q1,
                         )
+                        # Apply weight
+                        loss_augmentation_constraint = loss_augmentation_constraint_raw * self.augmentation_constraint_loss_weight
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_augmentation_constraint
                         slice_consistency_output['loss_dict']['augmentation_constraint_loss'] = loss_augmentation_constraint
                     
@@ -471,11 +585,13 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                             end_split=end_positions_feature,
                             split_interval_lengths=split_interval_lengths,
                         )
-                        loss_slice_consistency_constraint = self.slice_consistency.compute_slice_consistency_constraint_loss(
+                        loss_slice_consistency_constraint_raw = self.slice_consistency.compute_slice_consistency_constraint_loss(
                             full_first_codebook=original_full_q1,
                             slice_first_codebook=original_slice_q1,
                             slice_interval=orig_slice_interval,
                         )
+                        # Apply weight
+                        loss_slice_consistency_constraint = loss_slice_consistency_constraint_raw * self.slice_consistency_constraint_loss_weight
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_slice_consistency_constraint
                         slice_consistency_output['loss_dict']['slice_consistency_constraint_loss'] = loss_slice_consistency_constraint
                     
@@ -577,6 +693,139 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         # Store only codebook 0 accuracy
                         if 'augmentation_consistency_codebook0_accuracy' in augmentation_consistency:
                             slice_consistency_output['augmentation_consistency_codebook0_accuracy'] = augmentation_consistency['augmentation_consistency_codebook0_accuracy']
+                    
+                    # Compute inter-channel consistency loss (codebook 0 only)
+                    if is_multi_channel and self.use_inter_channel_consistency and C == 2 and inter_channel_cb0_indices is not None:
+                        ch0_cb0_indices, ch1_cb0_indices = inter_channel_cb0_indices
+                        ch0_cb0 = ch0_cb0_indices.unsqueeze(0)  # [1, B, T]
+                        ch1_cb0 = ch1_cb0_indices.unsqueeze(0)  # [1, B, T]
+                        
+                        inter_channel_acc = self.slice_consistency.compute_inter_channel_consistency(
+                            channel_a_codebook_indices=ch0_cb0,
+                            channel_b_codebook_indices=ch1_cb0,
+                        )
+                        
+                        # Compute loss using indices matching (1 - accuracy)
+                        matches = (ch0_cb0_indices == ch1_cb0_indices).float()  # [B, T]
+                        inter_channel_loss = 1.0 - matches.mean()  # MSE-like loss (1 - accuracy)
+                        
+                        inter_channel_weight = self.inter_channel_consistency.get('loss_weight', 15.0)
+                        weighted_inter_channel_loss = inter_channel_loss * inter_channel_weight
+                        
+                        # Add to slice_consistency_output
+                        if slice_consistency_output is None:
+                            slice_consistency_output = {
+                                'loss': torch.tensor(0.0, device=output.device, requires_grad=True),
+                                'loss_dict': {},
+                            }
+                        slice_consistency_output['loss'] = slice_consistency_output['loss'] + weighted_inter_channel_loss
+                        slice_consistency_output['loss_dict']['inter_channel_consistency_loss'] = weighted_inter_channel_loss
+                        
+                        # Store accuracy
+                        if 'inter_channel_consistency_codebook0_accuracy' in inter_channel_acc:
+                            slice_consistency_output['inter_channel_consistency_codebook0_accuracy'] = inter_channel_acc['inter_channel_consistency_codebook0_accuracy']
+                        else:
+                            slice_consistency_output['inter_channel_consistency_codebook0_accuracy'] = matches.mean().item()
+                    
+                    # Legacy inter-channel consistency (using full_codebook_indices - may not work if codebook 0 is skipped)
+                    if is_multi_channel and self.use_inter_channel_consistency and full_codebook_indices is not None and inter_channel_cb0_indices is None:
+                        # full_codebook_indices is [K, B*C, T] where B*C is batch*channels
+                        K, BC, T = full_codebook_indices.shape
+                        C = x.shape[1]  
+                        B = BC // C  
+                        
+                        # Reshape to [K, B, C, T]
+                        full_codebook_indices_reshaped = full_codebook_indices.reshape(K, B, C, T)
+                        
+                        # Get codebook index to compare (default: 0)
+                        codebook_idx = self.inter_channel_consistency.get('codebook_index', 0)
+                        if codebook_idx < K:
+                            # Extract codebook 0 indices for all channels [B, C, T]
+                            cb0_indices = full_codebook_indices_reshaped[codebook_idx]  # [B, C, T]
+                            
+                            # Compare each pair of channels for each batch item
+                            inter_channel_accuracies_list = []
+                            for b in range(B):
+                                # Get all channels for this batch item [C, T]
+                                batch_channels = cb0_indices[b]  # [C, T]
+                                
+                                # Compare each pair of channels
+                                for c1 in range(C):
+                                    for c2 in range(c1 + 1, C):
+                                        ch1_indices = batch_channels[c1:c1+1]  # [1, T]
+                                        ch2_indices = batch_channels[c2:c2+1]  # [1, T]
+                                        
+                                        # Compute consistency accuracy between these two channels
+                                        # Convert to [1, 1, T] format for the function
+                                        ch1_cb = ch1_indices.unsqueeze(0)  # [1, 1, T]
+                                        ch2_cb = ch2_indices.unsqueeze(0)  # [1, 1, T]
+                                        
+                                        inter_channel_acc = self.slice_consistency.compute_inter_channel_consistency(
+                                            channel_a_codebook_indices=ch1_cb,  # [1, 1, T]
+                                            channel_b_codebook_indices=ch2_cb,  # [1, 1, T]
+                                        )
+                                        
+                                        # Store codebook 0 accuracy
+                                        if 'inter_channel_consistency_codebook0_accuracy' in inter_channel_acc:
+                                            inter_channel_accuracies_list.append(inter_channel_acc['inter_channel_consistency_codebook0_accuracy'])
+                            
+                            # Average inter-channel accuracies across all pairs
+                            if inter_channel_accuracies_list:
+                                avg_inter_channel_acc = sum(inter_channel_accuracies_list) / len(inter_channel_accuracies_list)
+                                slice_consistency_output['inter_channel_consistency_codebook0_accuracy'] = avg_inter_channel_acc
+                    
+                    # Compute inter-channel consistency loss if multi-channel and enabled
+                    if is_multi_channel and self.use_inter_channel_consistency and full_sub_quants:
+                        # Get first codebook embeddings for all channels
+                        # full_sub_quants[0] is [K, B*C, D, T] after reshape
+                        # We need to reshape back to [K, B, C, D, T] to separate channels
+                        full_sub_quants_t = full_sub_quants[0]  # [K, B*C, D, T]
+                        K, BC, D, T_feat = full_sub_quants_t.shape
+                        
+                        # Reshape to [K, B, C, D, T]
+                        full_sub_quants_reshaped = full_sub_quants_t.reshape(K, B, C, D, T_feat)
+                        
+                        # Get codebook 0 embeddings [B, C, D, T]
+                        codebook_idx = self.inter_channel_consistency.get('codebook_index', 0)
+                        if codebook_idx < K:
+                            channel_codebooks = full_sub_quants_reshaped[codebook_idx]  # [B, C, D, T]
+                            
+                            # Compute inter-channel consistency between all pairs of channels
+                            # For each batch item, compare channel 0 with channel 1, channel 0 with channel 2, etc.
+                            inter_channel_losses = []
+                            for b in range(B):
+                                # Get all channels for this batch item [C, D, T]
+                                batch_channels = channel_codebooks[b]  # [C, D, T]
+                                
+                                # Compare each pair of channels
+                                for c1 in range(C):
+                                    for c2 in range(c1 + 1, C):
+                                        ch1_codebook = batch_channels[c1]  # [D, T]
+                                        ch2_codebook = batch_channels[c2]  # [D, T]
+                                        
+                                        # Compute consistency loss between these two channels
+                                        loss_inter = self.slice_consistency.compute_inter_channel_consistency_loss(
+                                            channel_a_codebook=ch1_codebook.unsqueeze(0),  # [1, D, T]
+                                            channel_b_codebook=ch2_codebook.unsqueeze(0),  # [1, D, T]
+                                            codebook_index=codebook_idx,
+                                            mse_loss_reduction=self.inter_channel_consistency.get('mse_loss_reduction', 'mean'),
+                                        )
+                                        inter_channel_losses.append(loss_inter)
+                            
+                            # Average inter-channel losses and weight them
+                            if inter_channel_losses:
+                                inter_channel_loss = sum(inter_channel_losses) / len(inter_channel_losses)
+                                inter_channel_weight = self.inter_channel_consistency.get('loss_weight', 10.0)
+                                weighted_inter_channel_loss = inter_channel_loss * inter_channel_weight
+                                
+                                # Add to slice_consistency_output
+                                if slice_consistency_output is None:
+                                    slice_consistency_output = {
+                                        'loss': torch.tensor(0.0, device=output.device, requires_grad=True),
+                                        'loss_dict': {},
+                                    }
+                                slice_consistency_output['loss'] = slice_consistency_output['loss'] + weighted_inter_channel_loss
+                                slice_consistency_output['loss_dict']['inter_channel_consistency_loss'] = weighted_inter_channel_loss
             
             if return_embeddings:
                 return output, loss_w, frames, quantized_embeddings, slice_consistency_output
@@ -593,27 +842,27 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                 self.perturb_encoder is not None and 
                 self.perturb_encoder.perturb_all_audio
             )
-            orig_audio = x.clone() if need_original_for_slice else None
+            orig_audio = x_reshaped.clone() if need_original_for_slice else None
             
             # Apply perturbation to full audio if enabled (even in eval mode for validation metrics)
             if self.perturb_encoder is not None and self.perturb_encoder.perturb_all_audio:
                 # Only create sample indices for deterministic behavior (validation), skip in training for speed
                 if batch_idx is not None:
-                    batch_size = x.shape[0]
-                    sample_indices = torch.arange(batch_size, device=x.device)
-                    x = self.perturb_encoder(x, batch_idx=batch_idx, sample_indices=sample_indices)
+                    batch_size = x_reshaped.shape[0]
+                    sample_indices = torch.arange(batch_size, device=x_reshaped.device)
+                    x_reshaped = self.perturb_encoder(x_reshaped, batch_idx=batch_idx, sample_indices=sample_indices)
                 else:
                     # Training mode: use simple call without extra parameters (faster)
-                    x = self.perturb_encoder(x)
+                    x_reshaped = self.perturb_encoder(x_reshaped)
             
             # In eval mode, encode() returns codes, not embeddings
             # We need to get embeddings directly from the encoder
             if self.training:
-                frames = self.encode(x)
+                frames = self.encode(x_reshaped)
             else:
                 # In eval mode, get embeddings directly from encoder
                 # Handle segmentation like encode() does
-                _, channels, length = x.shape
+                _, channels, length = x_reshaped.shape
                 segment_length = self.segment_length
                 if segment_length is None:
                     segment_length = length
@@ -624,7 +873,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                 
                 frames = []
                 for offset in range(0, length, stride):
-                    frame = x[:, :, offset: offset + segment_length]
+                    frame = x_reshaped[:, :, offset: offset + segment_length]
                     # Handle normalization
                     if self.normalize:
                         mono = frame.mean(dim=1, keepdim=True)
@@ -638,7 +887,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     emb = self.encoder(frame)  # [B, D, T]
                     frames.append((emb, scale))
             
-            loss_w = torch.tensor([0.0], device=x.device, requires_grad=False)
+            loss_w = torch.tensor([0.0], device=x_reshaped.device, requires_grad=False)
             codes = []
             quantized_embeddings = []
             
@@ -729,7 +978,11 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                             full_sub_quants.append(torch.stack(frame_sub_quants))  # [K, B, D, T]
             
             # Decode full audio
-            output = self.decode(codes)[:, :, :x.shape[-1]]
+            output = self.decode(codes)[:, :, :x_reshaped.shape[-1]]
+            
+            # Reshape output back to [B, C, T] if multi-channel
+            if is_multi_channel:
+                output = output.reshape(B, C, output.shape[-1])  # [B, C, T]
             
             # Compute slice consistency if requested
             slice_consistency_output = None
@@ -941,10 +1194,7 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         split_interval_lengths=slice_feature_lengths,
                     )
                     
-                    # Compute two constraint losses using only first codebook (Q1)
-                    # 1. Augmentation constraint loss: original full vs perturbed full
-                    # 2. Slice consistency constraint loss: original full vs original slice
-                    
+                    # Compute consistency losses using codebook 0 only
                     # Initialize output dictionary
                     slice_consistency_output = {
                         'loss': torch.tensor(0.0, device=emb.device, requires_grad=False),
@@ -1008,10 +1258,12 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     # Compute augmentation constraint loss: original full vs perturbed full
                     loss_augmentation_constraint = None
                     if original_full_q1 is not None and perturbed_full_q1 is not None:
-                        loss_augmentation_constraint = self.slice_consistency.compute_augmentation_constraint_loss(
+                        loss_augmentation_constraint_raw = self.slice_consistency.compute_augmentation_constraint_loss(
                             original_first_codebook=original_full_q1,
                             perturbed_first_codebook=perturbed_full_q1,
                         )
+                        # Apply weight
+                        loss_augmentation_constraint = loss_augmentation_constraint_raw * self.augmentation_constraint_loss_weight
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_augmentation_constraint
                         slice_consistency_output['loss_dict']['augmentation_constraint_loss'] = loss_augmentation_constraint
                     
@@ -1027,11 +1279,13 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                             end_split=end_positions_feature,
                             split_interval_lengths=split_interval_lengths,
                         )
-                        loss_slice_consistency_constraint = self.slice_consistency.compute_slice_consistency_constraint_loss(
+                        loss_slice_consistency_constraint_raw = self.slice_consistency.compute_slice_consistency_constraint_loss(
                             full_first_codebook=original_full_q1,
                             slice_first_codebook=original_slice_q1,
                             slice_interval=orig_slice_interval,
                         )
+                        # Apply weight
+                        loss_slice_consistency_constraint = loss_slice_consistency_constraint_raw * self.slice_consistency_constraint_loss_weight
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_slice_consistency_constraint
                         slice_consistency_output['loss_dict']['slice_consistency_constraint_loss'] = loss_slice_consistency_constraint
                     
@@ -1133,6 +1387,56 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         # Store only codebook 0 accuracy
                         if 'augmentation_consistency_codebook0_accuracy' in augmentation_consistency:
                             slice_consistency_output['augmentation_consistency_codebook0_accuracy'] = augmentation_consistency['augmentation_consistency_codebook0_accuracy']
+                    
+                    # Compute inter-channel consistency accuracy if multi-channel and enabled - CODEBOOK 0 ONLY
+                    if is_multi_channel and self.use_inter_channel_consistency and full_codebook_indices is not None:
+                        # full_codebook_indices is [K, B*C, T] where B*C is batch*channels
+                        # We need to reshape to [K, B, C, T] to separate channels
+                        K, BC, T = full_codebook_indices.shape
+                        # B is the batch size, C is the number of channels
+                        # In eval mode, use C from the original input x (available at function start)
+                        C = x.shape[1]  # Number of channels from original input
+                        B = BC // C  # Batch size
+                        
+                        # Reshape to [K, B, C, T]
+                        full_codebook_indices_reshaped = full_codebook_indices.reshape(K, B, C, T)
+                        
+                        # Get codebook index to compare (default: 0)
+                        codebook_idx = self.inter_channel_consistency.get('codebook_index', 0)
+                        if codebook_idx < K:
+                            # Extract codebook 0 indices for all channels [B, C, T]
+                            cb0_indices = full_codebook_indices_reshaped[codebook_idx]  # [B, C, T]
+                            
+                            # Compare each pair of channels for each batch item
+                            inter_channel_accuracies_list = []
+                            for b in range(B):
+                                # Get all channels for this batch item [C, T]
+                                batch_channels = cb0_indices[b]  # [C, T]
+                                
+                                # Compare each pair of channels
+                                for c1 in range(C):
+                                    for c2 in range(c1 + 1, C):
+                                        ch1_indices = batch_channels[c1:c1+1]  # [1, T]
+                                        ch2_indices = batch_channels[c2:c2+1]  # [1, T]
+                                        
+                                        # Compute consistency accuracy between these two channels
+                                        # Convert to [1, 1, T] format for the function
+                                        ch1_cb = ch1_indices.unsqueeze(0)  # [1, 1, T]
+                                        ch2_cb = ch2_indices.unsqueeze(0)  # [1, 1, T]
+                                        
+                                        inter_channel_acc = self.slice_consistency.compute_inter_channel_consistency(
+                                            channel_a_codebook_indices=ch1_cb,  # [1, 1, T]
+                                            channel_b_codebook_indices=ch2_cb,  # [1, 1, T]
+                                        )
+                                        
+                                        # Store codebook 0 accuracy
+                                        if 'inter_channel_consistency_codebook0_accuracy' in inter_channel_acc:
+                                            inter_channel_accuracies_list.append(inter_channel_acc['inter_channel_consistency_codebook0_accuracy'])
+                            
+                            # Average inter-channel accuracies across all pairs
+                            if inter_channel_accuracies_list:
+                                avg_inter_channel_acc = sum(inter_channel_accuracies_list) / len(inter_channel_accuracies_list)
+                                slice_consistency_output['inter_channel_consistency_codebook0_accuracy'] = avg_inter_channel_acc
             
             if return_embeddings:
                 return output, loss_w, frames, quantized_embeddings, slice_consistency_output
@@ -1155,26 +1459,8 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         n_q: tp.Optional[int] = None,
         slice_consistency: tp.Optional[dict] = None,
         perturb_encoder: tp.Optional[dict] = None,
+        inter_channel_consistency: tp.Optional[dict] = None,
     ):
-        """Create model with slice consistency support.
-        
-        Args:
-            slice_consistency: Dictionary with slice consistency parameters
-                - slice_interval_type: "random"
-                - split_interval_percentage: 0.2
-                - feature_types: ["quant_in"]
-                - loss_types: ["mse_loss"]
-                - loss_weights: [20.0]
-                - target_sr: 24000
-                - ds_rate: 320
-                - mse_loss_reduction: "mean"
-            perturb_encoder: Dictionary with perturbation parameters
-                - perturb_methods: ["volume_aug", "inversion_aug"]
-                - volume_aug_config: {"gain_range": (0.5, 2.0), "apply_prob": 0.5}
-                - inversion_aug_config: {"apply_prob": 0.5}
-                - perturb_all_audio: True
-                - perturb_slice_audio: True
-        """
         encoder = m.SEANetEncoder(channels=channels, norm=model_norm, causal=causal, ratios=ratios)
         decoder = m.SEANetDecoder(channels=channels, norm=model_norm, causal=causal, ratios=ratios)
         
@@ -1199,5 +1485,6 @@ class EncodecModelWithSliceConsistency(EncodecModel):
             name=name,
             slice_consistency=slice_consistency,
             perturb_encoder=perturb_encoder,
+            inter_channel_consistency=inter_channel_consistency,
         )
         return model

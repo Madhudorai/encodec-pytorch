@@ -46,7 +46,6 @@ class SliceConsistency(nn.Module):
         split_interval_percentage: Percentage of audio to use for slice (0.0-1.0)
         feature_types: List of feature types to compare ["quant_in", "quant_out", "sub_quants"]
         loss_types: List of loss types to use ["mse_loss"]
-        loss_weights: List of weights for each loss type
         target_sr: Target sample rate
         ds_rate: Downsampling rate (encoder hop length)
         mse_loss_reduction: Reduction method for MSE loss ("mean" or "sum")
@@ -58,7 +57,6 @@ class SliceConsistency(nn.Module):
         split_interval_percentage: float = 0.2,
         feature_types: tp.List[str] = None,
         loss_types: tp.List[str] = None,
-        loss_weights: tp.List[float] = None,
         target_sr: int = 24000,
         ds_rate: int = 320,
         mse_loss_reduction: str = "mean",
@@ -69,7 +67,6 @@ class SliceConsistency(nn.Module):
         self.split_interval_percentage = split_interval_percentage
         self.feature_types = feature_types if feature_types is not None else ["quant_in"]
         self.loss_types = loss_types if loss_types is not None else ["mse_loss"]
-        self.loss_weights = loss_weights if loss_weights is not None else [20.0]
         self.target_sr = target_sr
         self.ds_rate = ds_rate
         self.mse_loss_reduction = mse_loss_reduction
@@ -77,8 +74,6 @@ class SliceConsistency(nn.Module):
         # Validate inputs
         assert len(self.feature_types) == len(self.loss_types), \
             f"feature_types and loss_types must have same length, got {len(self.feature_types)} and {len(self.loss_types)}"
-        assert len(self.loss_types) == len(self.loss_weights), \
-            f"loss_types and loss_weights must have same length, got {len(self.loss_types)} and {len(self.loss_weights)}"
     
     def gather_features(
         self,
@@ -290,10 +285,9 @@ class SliceConsistency(nn.Module):
             else:
                 raise ValueError(f"Unknown loss type: {self.loss_types[i]}")
             
-            # Weight the loss
-            weighted_loss = feature_loss * self.loss_weights[i]
-            loss_dict[f"{feature_type}_{self.loss_types[i]}"] = weighted_loss
-            total_loss = total_loss + weighted_loss
+            # Store loss (unweighted, since this is only used for metrics, not training)
+            loss_dict[f"{feature_type}_{self.loss_types[i]}"] = feature_loss
+            total_loss = total_loss + feature_loss
         
         # Compute codebook consistency accuracy if codebook indices are provided
         codebook_accuracy = None
@@ -495,6 +489,93 @@ class SliceConsistency(nn.Module):
         
         return augmentation_accuracies
     
+    def compute_inter_channel_consistency(
+        self,
+        channel_a_codebook_indices: torch.Tensor,
+        channel_b_codebook_indices: torch.Tensor,
+        attention_mask: tp.Optional[torch.Tensor] = None,
+    ) -> tp.Dict[str, float]:
+        """Compute inter-channel consistency accuracy.
+        
+        Compares codebook indices between two channels of the same audio file.
+        This measures how consistent the model is across different channels.
+        
+        Args:
+            channel_a_codebook_indices: Channel A codebook indices [K, B, T]
+            channel_b_codebook_indices: Channel B codebook indices [K, B, T]
+            attention_mask: Optional attention mask [B, T] or [K, B, T]
+            
+        Returns:
+            Dictionary with inter-channel consistency accuracy metrics:
+                - 'inter_channel_consistency_accuracy': Overall accuracy across all codebooks
+                - 'inter_channel_consistency_codebook0_accuracy': First codebook accuracy
+                - 'inter_channel_consistency_first_3_codebooks_accuracy': Average of first 3 codebooks
+                - 'inter_channel_consistency_codebook{k}_accuracy': Accuracy for each codebook k
+        """
+        device = channel_a_codebook_indices.device
+        K, B, T = channel_a_codebook_indices.shape
+        
+        # Ensure shapes match
+        if channel_b_codebook_indices.shape != channel_a_codebook_indices.shape:
+            # If lengths differ, use minimum length
+            min_T = min(T, channel_b_codebook_indices.shape[2])
+            channel_a_codebook_indices = channel_a_codebook_indices[:, :, :min_T]
+            channel_b_codebook_indices = channel_b_codebook_indices[:, :, :min_T]
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    attention_mask = attention_mask[:, :min_T]
+                else:
+                    attention_mask = attention_mask[:, :, :min_T]
+            T = min_T
+        
+        # Create attention mask if not provided (all positions are valid)
+        if attention_mask is None:
+            attention_mask = torch.ones(K, B, T, device=device, dtype=torch.bool)
+        elif attention_mask.dim() == 2:
+            # [B, T] -> [K, B, T]
+            attention_mask = attention_mask.unsqueeze(0).expand(K, -1, -1)
+        
+        # Compute accuracy for each codebook
+        inter_channel_accuracies = {}
+        
+        for k in range(K):
+            # Get codebook indices for this codebook
+            ch_a_cb = channel_a_codebook_indices[k]  # [B, T]
+            ch_b_cb = channel_b_codebook_indices[k]  # [B, T]
+            cb_attention = attention_mask[k]  # [B, T]
+            
+            # Compute matches: indices match AND within attention mask
+            valid_mask = cb_attention
+            matches = (ch_a_cb == ch_b_cb) & valid_mask
+            
+            # Compute accuracy for this codebook
+            total_valid = valid_mask.sum().item()
+            if total_valid > 0:
+                acc = matches.sum().item() / total_valid
+                inter_channel_accuracies[f'inter_channel_consistency_codebook{k}_accuracy'] = acc
+            else:
+                inter_channel_accuracies[f'inter_channel_consistency_codebook{k}_accuracy'] = 0.0
+        
+        # Overall accuracy across all codebooks
+        all_valid = attention_mask
+        all_matches = (channel_a_codebook_indices == channel_b_codebook_indices) & all_valid
+        total_valid = all_valid.sum().item()
+        if total_valid > 0:
+            inter_channel_accuracies['inter_channel_consistency_accuracy'] = all_matches.sum().item() / total_valid
+        else:
+            inter_channel_accuracies['inter_channel_consistency_accuracy'] = 0.0
+        
+        # First codebook accuracy (most important)
+        if K > 0 and 'inter_channel_consistency_codebook0_accuracy' in inter_channel_accuracies:
+            inter_channel_accuracies['inter_channel_consistency_codebook0_accuracy'] = inter_channel_accuracies['inter_channel_consistency_codebook0_accuracy']
+        
+        # First 3 codebooks average accuracy
+        if K >= 3:
+            first_3_accs = [inter_channel_accuracies.get(f'inter_channel_consistency_codebook{k}_accuracy', 0.0) for k in range(3)]
+            inter_channel_accuracies['inter_channel_consistency_first_3_codebooks_accuracy'] = sum(first_3_accs) / 3.0
+        
+        return inter_channel_accuracies
+    
     def compute_augmentation_constraint_loss(
         self,
         original_first_codebook: torch.Tensor,
@@ -599,5 +680,80 @@ class SliceConsistency(nn.Module):
             loss = mse.sum()
         else:
             raise ValueError(f"Unknown mse_loss_reduction: {self.mse_loss_reduction}")
+        
+        return loss
+    
+    def compute_inter_channel_consistency_loss(
+        self,
+        channel_a_codebook: torch.Tensor,
+        channel_b_codebook: torch.Tensor,
+        codebook_index: int = 0,
+        mse_loss_reduction: str = "mean",
+    ) -> torch.Tensor:
+        """Compute inter-channel consistency loss.
+        
+        This loss ensures that codebook 0 encodings from different channels of the same
+        audio file are as similar as possible. This encourages the model to learn
+        channel-invariant representations.
+        
+        Args:
+            channel_a_codebook: Codebook embeddings from channel A [B, D, T] or [B, T, D]
+            channel_b_codebook: Codebook embeddings from channel B [B, D, T] or [B, T, D]
+            codebook_index: Which codebook to compare (default: 0)
+            mse_loss_reduction: Reduction method for MSE loss ("mean" or "sum")
+            
+        Returns:
+            MSE loss between channel A and channel B codebook embeddings [scalar tensor]
+        """
+        device = channel_a_codebook.device
+        
+        # Ensure shapes match (use minimum length if they differ)
+        if channel_a_codebook.dim() == 3:
+            # [B, D, T] format
+            B_a, D_a, T_a = channel_a_codebook.shape
+            B_b, D_b, T_b = channel_b_codebook.shape
+            min_T = min(T_a, T_b)
+            
+            ch_a = channel_a_codebook[:, :, :min_T]  # [B, D, T]
+            ch_b = channel_b_codebook[:, :, :min_T]  # [B, D, T]
+        elif channel_a_codebook.dim() == 2:
+            # [B, T] format (codebook indices)
+            B_a, T_a = channel_a_codebook.shape
+            B_b, T_b = channel_b_codebook.shape
+            min_T = min(T_a, T_b)
+            
+            ch_a = channel_a_codebook[:, :min_T]  # [B, T]
+            ch_b = channel_b_codebook[:, :min_T]  # [B, T]
+        else:
+            raise ValueError(f"Expected 2D or 3D tensors, got {channel_a_codebook.dim()}D")
+        
+        # Ensure batch sizes match
+        if B_a != B_b:
+            min_B = min(B_a, B_b)
+            ch_a = ch_a[:min_B]
+            ch_b = ch_b[:min_B]
+        
+        # Compute MSE loss
+        if ch_a.dim() == 3:
+            # [B, D, T] - compare embeddings
+            diff = ch_a - ch_b
+            mse = diff ** 2  # [B, D, T]
+            
+            if mse_loss_reduction == "mean":
+                loss = mse.mean()
+            elif mse_loss_reduction == "sum":
+                loss = mse.sum()
+            else:
+                raise ValueError(f"Unknown mse_loss_reduction: {mse_loss_reduction}")
+        else:
+            # [B, T] - compare indices (shouldn't happen for embeddings, but handle it)
+            diff = (ch_a.float() - ch_b.float()) ** 2  # [B, T]
+            
+            if mse_loss_reduction == "mean":
+                loss = diff.mean()
+            elif mse_loss_reduction == "sum":
+                loss = diff.sum()
+            else:
+                raise ValueError(f"Unknown mse_loss_reduction: {mse_loss_reduction}")
         
         return loss
