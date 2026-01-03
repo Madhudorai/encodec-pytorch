@@ -8,7 +8,7 @@ common:
 
 datasets:
   # Eigenscape dataset configuration
-  eigenscape_base_path: '/scratch/iran/eigenscape'
+  eigenscape_base_path: '/scratch/eigenscape'
   eigenscape_train_folders: [Beach, 'Busy Street', Park, 'Pedestrian Zone', 'Quiet Street', 'Shopping Centre']
   eigenscape_valid_folders: ['Train Station', Woodland]
   num_channels_to_load: 2  # Number of random channels to load from each 32-channel file
@@ -55,8 +55,8 @@ model:
     split_interval_percentage: 0.2  # 20% of audio length for random slices
     feature_types: ["quant_in"]  # Features to compare: ["quant_in", "quant_out", "sub_quants"]
     loss_types: ["mse_loss"]  # Loss types: ["mse_loss"]
-    augmentation_constraint_loss_weight: 15.0  
-    slice_consistency_constraint_loss_weight: 15.0  
+    augmentation_constraint_loss_weight: 1.0  
+    slice_consistency_constraint_loss_weight: 1.0  
     target_sr: 24000
     ds_rate: 320  # Downsampling rate (encoder hop length)
     mse_loss_reduction: mean  # "mean" or "sum"
@@ -77,7 +77,7 @@ model:
     enabled: True
     codebook_index: 0  # Only compare codebook 0 between channels
     loss_type: mse_loss  # "mse_loss"
-    loss_weight: 15.0  # Weight for inter-channel consistency loss
+    loss_weight: 1.0  # Weight for inter-channel consistency loss
     mse_loss_reduction: mean  # "mean" or "sum"
 
 distributed:

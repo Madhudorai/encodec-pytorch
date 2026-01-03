@@ -48,7 +48,41 @@ def calculate_confidence_interval(values, confidence=0.95):
     return mean, mean - margin_error, mean + margin_error
 
 
-def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloader, config, scheduler, disc_scheduler, scaler=None, scaler_disc=None, balancer=None, wandb_logger=None):
+def compute_cosine_weight_factor(epoch, start_epoch, max_epoch, start_weight, end_weight):
+    """Compute cosine annealing/ramp-up weight factor.
+    
+    Args:
+        epoch: Current epoch number
+        start_epoch: Starting epoch (usually 1)
+        max_epoch: Maximum epoch number
+        start_weight: Starting weight value
+        end_weight: Ending weight value
+    
+    Returns:
+        Weight factor interpolated between start_weight and end_weight using cosine schedule
+    """
+    if max_epoch <= start_epoch:
+        return end_weight
+    
+    # Compute progress from 0 to 1
+    progress = (epoch - start_epoch) / (max_epoch - start_epoch)
+    progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
+    
+    # Cosine interpolation: weight = start + (end - start) * (1 - cos(π * progress)) / 2
+    import math
+    cosine_factor = (1 - math.cos(math.pi * progress)) / 2
+    weight = start_weight + (end_weight - start_weight) * cosine_factor
+    
+    return weight
+
+
+def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloader, config, scheduler, disc_scheduler, scaler=None, scaler_disc=None, balancer=None, wandb_logger=None, model_weight_factor=1.0, consistency_weight_factor=1.0):
+    """Train one step function with slice consistency loss and cosine weight scheduling.
+    
+    Args:
+        model_weight_factor: Scaling factor for model losses (loss_g, loss_w). Cosine anneals from 1.0 to 0.5.
+        consistency_weight_factor: Scaling factor for consistency losses. Cosine ramps from 0.1 to 1.0.
+    """
     """Train one step function with slice consistency loss."""
     model.train()
     disc_model.train()
@@ -98,15 +132,23 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         if config.common.amp: 
             loss_g = 3*losses_g['l_g'] + 3*losses_g['l_feat'] + losses_g['l_t']/10 + losses_g['l_f']
             
+            # Apply model weight scaling (cosine annealing: 1.0 -> 0.5)
+            loss_g = loss_g * model_weight_factor
+            loss_w_scaled = loss_w * model_weight_factor
+            
             # Add slice consistency loss if available
             if slice_consistency_output is not None:
                 loss_slice = slice_consistency_output['loss']
+                # Apply consistency weight scaling (cosine ramp-up: 0.1 -> 1.0)
+                loss_slice = loss_slice * consistency_weight_factor
                 loss_g = loss_g + loss_slice
                 accumulated_loss_slice += loss_slice.item()
                 for k, v in slice_consistency_output['loss_dict'].items():
-                    accumulated_losses_slice[k] += v.item() if isinstance(v, torch.Tensor) else v
+                    # Scale individual loss components for logging
+                    scaled_v = v.item() * consistency_weight_factor if isinstance(v, torch.Tensor) else v * consistency_weight_factor
+                    accumulated_losses_slice[k] += scaled_v
             
-            loss_g = loss_g + loss_w
+            loss_g = loss_g + loss_w_scaled
             
             scaler.scale(loss_g).backward()  
             scaler.step(optimizer)  
@@ -120,13 +162,21 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             else:
                 loss_g = 3*losses_g['l_g'] + 3*losses_g['l_feat'] + losses_g['l_t']/10 + losses_g['l_f']
             
+            # Apply model weight scaling (cosine annealing: 1.0 -> 0.5)
+            loss_g = loss_g * model_weight_factor
+            loss_w_scaled = loss_w * model_weight_factor
+            
             # Add slice consistency loss if available
             loss_slice = None
             if slice_consistency_output is not None:
                 loss_slice = slice_consistency_output['loss']
+                # Apply consistency weight scaling (cosine ramp-up: 0.1 -> 1.0)
+                loss_slice = loss_slice * consistency_weight_factor
                 accumulated_loss_slice += loss_slice.item()
                 for k, v in slice_consistency_output['loss_dict'].items():
-                    accumulated_losses_slice[k] += v.item() if isinstance(v, torch.Tensor) else v
+                    # Scale individual loss components for logging
+                    scaled_v = v.item() * consistency_weight_factor if isinstance(v, torch.Tensor) else v * consistency_weight_factor
+                    accumulated_losses_slice[k] += scaled_v
                 # Add to loss_g for accumulation (convert to tensor if needed)
                 if balancer is not None:
                     # loss_g is scalar, convert loss_slice to scalar for accumulation
@@ -137,14 +187,14 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             
             # Backward: combine all losses before backward to avoid graph violation
             if balancer is None:
-                # Combine all losses (loss_g, loss_w, loss_slice) and backward once
-                combined_loss = loss_g + loss_w
+                # Combine all losses (loss_g, loss_w_scaled, loss_slice) and backward once
+                combined_loss = loss_g + loss_w_scaled
                 combined_loss.backward()
             else:
                 # Balancer already backwarded on output, so we need to backward
-                # loss_w and loss_slice separately with retain_graph=True
+                # loss_w_scaled and loss_slice separately with retain_graph=True
                 # (they share the same computational graph as output)
-                loss_w.backward(retain_graph=True)
+                loss_w_scaled.backward(retain_graph=True)
                 if loss_slice is not None:
                     loss_slice.backward(retain_graph=True)
             
@@ -157,7 +207,8 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             accumulated_loss_g += loss_g
         for k, l in losses_g.items():
             accumulated_losses_g[k] += l.item()
-        accumulated_loss_w += loss_w.item()
+        # loss_w_scaled is defined in both AMP and non-AMP paths
+        accumulated_loss_w += loss_w_scaled.item()
 
         # Update discriminator with probability
         optimizer_disc.zero_grad()
@@ -202,6 +253,7 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         log_msg += f" | loss_slice: {avg_loss_slice:.4f}"
     
     log_msg += f" | lr_G: {optimizer.param_groups[0]['lr']:.6e} | lr_D: {optimizer_disc.param_groups[0]['lr']:.6e}"
+    log_msg += f" | w_model: {model_weight_factor:.3f} | w_consistency: {consistency_weight_factor:.3f}"
     
     if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
         log_msg += f" | loss_disc: {avg_loss_disc:.4f}"
@@ -216,6 +268,8 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             'train/loss_w': avg_loss_w,
             'train/lr_g': optimizer.param_groups[0]['lr'],
             'train/lr_d': optimizer_disc.param_groups[0]['lr'],
+            'train/model_weight_factor': model_weight_factor,
+            'train/consistency_weight_factor': consistency_weight_factor,
         }
         for k, l in accumulated_losses_g.items():
             log_dict[f'train/{k}'] = l / data_length
@@ -539,7 +593,7 @@ def train(config):
         disc_model.cuda()
 
     logger.info(f"Training: {len(trainloader)} batches (batch_size={config.datasets.batch_size})")
-    logger.info(f"Validation: 10k fixed segments per epoch (batch_size={config.datasets.batch_size})")
+    logger.info(f"Validation: 2k fixed segments per epoch (batch_size={config.datasets.batch_size})")
 
     # Set up optimizers and schedulers
     params = [p for p in model.parameters() if p.requires_grad]
@@ -595,10 +649,24 @@ def train(config):
     
     # Training loop
     for epoch in range(start_epoch, config.common.max_epoch + 1):
+        # Compute cosine weight factors for this epoch
+        # Model weights: start at 1.0, gradually decrease to 0.5
+        model_weight_factor = compute_cosine_weight_factor(
+            epoch, start_epoch, config.common.max_epoch, 
+            start_weight=1.0, end_weight=0.5
+        )
+        # Consistency weights: start at 0.1, gradually increase to 1.0
+        consistency_weight_factor = compute_cosine_weight_factor(
+            epoch, start_epoch, config.common.max_epoch,
+            start_weight=0.1, end_weight=1.0
+        )
+        
         train_one_step(
             epoch, optimizer, optimizer_disc, 
             model, disc_model, trainloader, config,
-            scheduler, disc_scheduler, scaler, scaler_disc, balancer, wandb_logger
+            scheduler, disc_scheduler, scaler, scaler_disc, balancer, wandb_logger,
+            model_weight_factor=model_weight_factor,
+            consistency_weight_factor=consistency_weight_factor
         )
         
         # Validation
