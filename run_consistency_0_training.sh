@@ -39,7 +39,7 @@ python train_consistency_0.py \
     --config-name=config_consistency_0 \
     common.max_epoch=200 \
     common.val_interval=5 \
-    datasets.batch_size=8 \
+    datasets.batch_size=4 \
     datasets.fixed_length=16000 \
     model.sample_rate=24000 \
     model.channels=2 \
@@ -55,6 +55,6 @@ python train_consistency_0.py \
     model.perturb_encoder.perturb_slice_audio=true \
     wandb.enabled=true \
     wandb.project=eigenscape-encodec-consistency-0 \
-    wandb.name=eigenscape_consistency_0_bs8_epochs200_24khz
+    wandb.name=eigenscape_consistency_0_bs4_epochs200_24khz
 
 echo "Training completed!"

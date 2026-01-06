@@ -13,10 +13,10 @@ datasets:
   eigenscape_valid_folders: ['Train Station', Woodland]
   num_channels_to_load: 2  # Number of random channels to load from each 32-channel file
   
-  batch_size: 8
+  batch_size: 4  # Reduced from 8 to fit GPU memory with consistency training (effective batch_size=8 with 2 channels)
   tensor_cut: 24000  # 1 second at 24kHz
   num_workers: 4
-  fixed_length: 10000  # 10k samples per epoch (10000 / 8 batch_size = 1250 batches per epoch)
+  fixed_length: 10000  # 10k samples per epoch (10000 / 4 batch_size = 2500 batches per epoch)
   pin_memory: False  # Disable to save memory
 
 checkpoint:
@@ -98,5 +98,5 @@ balancer:
 wandb:
   enabled: True
   project: 'eigenscape-encodec-consistency-0'
-  name: 'eigenscape_consistency_0_bs8_epochs200_24khz'
+  name: 'eigenscape_consistency_0_bs4_epochs200_24khz'
   upload_artifacts: False   

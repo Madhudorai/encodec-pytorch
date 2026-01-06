@@ -110,7 +110,8 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         optimizer.zero_grad()
         
         with autocast(enabled=config.common.amp):
-            output, loss_w, _, slice_consistency_output = model(input_wav, return_slice_consistency=True)
+            # Pass batch_idx to enable alternating consistency losses (reduces memory)
+            output, loss_w, _, slice_consistency_output = model(input_wav, return_slice_consistency=True, batch_idx=idx)
             
             # Reshape discriminator input to [B*C, 1, T] for consistency with encoder/decoder
             B, C, T = input_wav.shape

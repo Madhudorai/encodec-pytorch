@@ -173,11 +173,29 @@ class EncodecModelWithSliceConsistency(EncodecModel):
         # We need it if: slice consistency is enabled AND we're perturbing full audio
         # (because we want to extract slice from original, not perturbed, so slice can be augmented independently)
         # OR if we want to compute augmentation consistency (original vs perturbed)
+        # OPTIMIZATION: Alternate between augmentation and slice consistency to reduce memory
+        # Use batch_idx to alternate: even batches = slice consistency, odd batches = augmentation consistency
+        alternate_consistency = (
+            self.use_slice_consistency and 
+            self.perturb_encoder is not None and 
+            self.perturb_encoder.perturb_all_audio and
+            batch_idx is not None and
+            self.training  # Only alternate during training
+        )
+        if alternate_consistency:
+            compute_augmentation = (batch_idx % 2 == 1)  # Odd batches: augmentation
+            compute_slice = (batch_idx % 2 == 0)  # Even batches: slice
+        else:
+            # Default: compute both (validation or no batch_idx)
+            compute_augmentation = True
+            compute_slice = True
+        
         need_original = (
             return_slice_consistency and 
             self.use_slice_consistency and 
             self.perturb_encoder is not None and 
-            self.perturb_encoder.perturb_all_audio
+            self.perturb_encoder.perturb_all_audio and
+            (compute_augmentation or compute_slice)  # Only if we need it
         )
         orig_audio = x_reshaped.clone() if need_original else None
         
@@ -370,51 +388,59 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     audio_length = T  # Each channel has T samples
                     end_positions_audio = torch.clamp(end_positions_audio, max=audio_length)
                     
-                    # Extract the SAME slice from both original and perturbed full audio
-                    # This aligns latent representations from slice-consistency and perturbation-consistency methods
-                    # IMPORTANT: For separate channel processing [B*C, 1, T], we extract slices
-                    # from the original x [B, C, T] format, ensuring slices stay within [0, T] for each channel
-                    
-                    # batch_size is B*C, so we need to map back to [B, C, T] format
-                    # For each sample in batch, extract slice from its corresponding channel
-                    if orig_audio is not None:
-                        # orig_audio is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
-                        orig_audio_reshaped = orig_audio.reshape(B, C, T)  # [B, C, T]
+                    # OPTIMIZATION: Only compute slices if compute_slice is True (alternating batches)
+                    if compute_slice:
+                        # Extract the SAME slice from both original and perturbed full audio
+                        # This aligns latent representations from slice-consistency and perturbation-consistency methods
+                        # IMPORTANT: For separate channel processing [B*C, 1, T], we extract slices
+                        # from the original x [B, C, T] format, ensuring slices stay within [0, T] for each channel
+                        
+                        # batch_size is B*C, so we need to map back to [B, C, T] format
+                        # For each sample in batch, extract slice from its corresponding channel
+                        if orig_audio is not None:
+                            # orig_audio is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
+                            orig_audio_reshaped = orig_audio.reshape(B, C, T)  # [B, C, T]
+                        else:
+                            orig_audio_reshaped = x  # [B, C, T]
+                        
+                        # x_reshaped is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
+                        x_reshaped_back = x_reshaped.reshape(B, C, T)  # [B, C, T]
+                        
+                        # Extract slice from original full audio [B, C, T]
+                        slice_from_original_list = []
+                        for bc_idx in range(batch_size):
+                            # Map bc_idx back to (b, c)
+                            b = bc_idx // C
+                            c = bc_idx % C
+                            start_pos = start_positions_audio[bc_idx].item()
+                            end_pos = end_positions_audio[bc_idx].item()
+                            # Extract slice from channel c of batch b
+                            slice_from_original_list.append(orig_audio_reshaped[b:b+1, c:c+1, start_pos:end_pos])
+                        slice_from_original = torch.cat(slice_from_original_list, dim=0)  # [B*C, 1, T_slice]
+                        
+                        # Extract the SAME slice from perturbed full audio
+                        slice_from_perturbed_list = []
+                        for bc_idx in range(batch_size):
+                            # Map bc_idx back to (b, c)
+                            b = bc_idx // C
+                            c = bc_idx % C
+                            start_pos = start_positions_audio[bc_idx].item()
+                            end_pos = end_positions_audio[bc_idx].item()
+                            # Extract slice from channel c of batch b
+                            slice_from_perturbed_list.append(x_reshaped_back[b:b+1, c:c+1, start_pos:end_pos])
+                        slice_from_perturbed = torch.cat(slice_from_perturbed_list, dim=0)  # [B*C, 1, T_slice]
+                        
+                        # Encode both slices
+                        slice_original_frames = self.encode(slice_from_original)
+                        slice_perturbed_frames = self.encode(slice_from_perturbed)
                     else:
-                        orig_audio_reshaped = x  # [B, C, T]
+                        # Skip slice encoding to save memory
+                        slice_original_frames = None
+                        slice_perturbed_frames = None
+                        slice_from_original = None
+                        slice_from_perturbed = None
                     
-                    # x_reshaped is [B*C, 1, T] - reshape back to [B, C, T] for slice extraction
-                    x_reshaped_back = x_reshaped.reshape(B, C, T)  # [B, C, T]
-                    
-                    # Extract slice from original full audio [B, C, T]
-                    slice_from_original_list = []
-                    for bc_idx in range(batch_size):
-                        # Map bc_idx back to (b, c)
-                        b = bc_idx // C
-                        c = bc_idx % C
-                        start_pos = start_positions_audio[bc_idx].item()
-                        end_pos = end_positions_audio[bc_idx].item()
-                        # Extract slice from channel c of batch b
-                        slice_from_original_list.append(orig_audio_reshaped[b:b+1, c:c+1, start_pos:end_pos])
-                    slice_from_original = torch.cat(slice_from_original_list, dim=0)  # [B*C, 1, T_slice]
-                    
-                    # Extract the SAME slice from perturbed full audio
-                    slice_from_perturbed_list = []
-                    for bc_idx in range(batch_size):
-                        # Map bc_idx back to (b, c)
-                        b = bc_idx // C
-                        c = bc_idx % C
-                        start_pos = start_positions_audio[bc_idx].item()
-                        end_pos = end_positions_audio[bc_idx].item()
-                        # Extract slice from channel c of batch b
-                        slice_from_perturbed_list.append(x_reshaped_back[b:b+1, c:c+1, start_pos:end_pos])
-                    slice_from_perturbed = torch.cat(slice_from_perturbed_list, dim=0)  # [B*C, 1, T_slice]
-                    
-                    # Encode both slices
-                    slice_original_frames = self.encode(slice_from_original)
-                    slice_perturbed_frames = self.encode(slice_from_perturbed)
-                    
-                    # Get features from both slices
+                    # Get features from both slices (only if compute_slice is True)
                     slice_original_features = {}
                     slice_perturbed_features = {}
                     slice_original_codebook_indices = []
@@ -422,81 +448,86 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                     slice_original_sub_quants = []
                     slice_perturbed_sub_quants = []
                     
-                    for (emb_slice_orig, scale_slice_orig), (emb_slice_pert, scale_slice_pert) in zip(slice_original_frames, slice_perturbed_frames):
-                        slice_original_features["quant_in"] = emb_slice_orig  # [B, D, T_slice]
-                        slice_perturbed_features["quant_in"] = emb_slice_pert  # [B, D, T_slice]
+                    if slice_original_frames is not None and slice_perturbed_frames is not None:
+                        for (emb_slice_orig, scale_slice_orig), (emb_slice_pert, scale_slice_pert) in zip(slice_original_frames, slice_perturbed_frames):
+                            slice_original_features["quant_in"] = emb_slice_orig  # [B, D, T_slice]
+                            slice_perturbed_features["quant_in"] = emb_slice_pert  # [B, D, T_slice]
+                            
+                            # Quantize both slices with same bandwidth
+                            qv_slice_orig = self.quantizer(emb_slice_orig, self.frame_rate, bw)
+                            qv_slice_pert = self.quantizer(emb_slice_pert, self.frame_rate, bw)
+                            
+                            slice_original_features["quant_out"] = qv_slice_orig.quantized  # [B, D, T_slice]
+                            slice_perturbed_features["quant_out"] = qv_slice_pert.quantized  # [B, D, T_slice]
+                            
+                            slice_original_codebook_indices.append(qv_slice_orig.codes)  # [K, B, T_slice]
+                            slice_perturbed_codebook_indices.append(qv_slice_pert.codes)  # [K, B, T_slice]
+                            
+                            # Get sub_quants for both slices
+                            for emb_slice, qv_slice, sub_quants_list in [
+                                (emb_slice_orig, qv_slice_orig, slice_original_sub_quants),
+                                (emb_slice_pert, qv_slice_pert, slice_perturbed_sub_quants)
+                            ]:
+                                residual = emb_slice
+                                frame_sub_quants = []
+                                n_q_used = min(len(self.quantizer.vq.layers), qv_slice.codes.shape[0])
+                                for i in range(n_q_used):
+                                    layer = self.quantizer.vq.layers[i]
+                                    quantized, indices, layer_loss = layer(residual)
+                                    frame_sub_quants.append(quantized)
+                                    residual = residual - quantized.detach()
+                                if frame_sub_quants:
+                                    sub_quants_list.append(torch.stack(frame_sub_quants))  # [K, B, D, T_slice]
+                    
+                    # Convert features to [B, T, D] format for consistency computation (only if slices were computed)
+                    slice_original_features_dict = None
+                    slice_perturbed_features_dict = None
+                    slice_interval = None
+                    if compute_slice and slice_original_frames is not None and slice_perturbed_frames is not None:
+                        # Slice from original audio features
+                        slice_orig_quant_in = slice_original_features["quant_in"].transpose(1, 2)  # [B, T_slice, D]
+                        slice_orig_quant_out = slice_original_features["quant_out"].transpose(1, 2)  # [B, T_slice, D]
                         
-                        # Quantize both slices with same bandwidth
-                        qv_slice_orig = self.quantizer(emb_slice_orig, self.frame_rate, bw)
-                        qv_slice_pert = self.quantizer(emb_slice_pert, self.frame_rate, bw)
+                        # Slice from perturbed audio features
+                        slice_pert_quant_in = slice_perturbed_features["quant_in"].transpose(1, 2)  # [B, T_slice, D]
+                        slice_pert_quant_out = slice_perturbed_features["quant_out"].transpose(1, 2)  # [B, T_slice, D]
                         
-                        slice_original_features["quant_out"] = qv_slice_orig.quantized  # [B, D, T_slice]
-                        slice_perturbed_features["quant_out"] = qv_slice_pert.quantized  # [B, D, T_slice]
+                        # Handle sub_quants - convert from [K, B, D, T] to [K, B, T, D]
+                        slice_orig_sub_quants_t = None
+                        if slice_original_sub_quants and len(slice_original_sub_quants) > 0:
+                            slice_orig_sub_quants_t = slice_original_sub_quants[0].transpose(2, 3)  # [K, B, T_slice, D]
                         
-                        slice_original_codebook_indices.append(qv_slice_orig.codes)  # [K, B, T_slice]
-                        slice_perturbed_codebook_indices.append(qv_slice_pert.codes)  # [K, B, T_slice]
+                        slice_pert_sub_quants_t = None
+                        if slice_perturbed_sub_quants and len(slice_perturbed_sub_quants) > 0:
+                            slice_pert_sub_quants_t = slice_perturbed_sub_quants[0].transpose(2, 3)  # [K, B, T_slice, D]
                         
-                        # Get sub_quants for both slices
-                        for emb_slice, qv_slice, sub_quants_list in [
-                            (emb_slice_orig, qv_slice_orig, slice_original_sub_quants),
-                            (emb_slice_pert, qv_slice_pert, slice_perturbed_sub_quants)
-                        ]:
-                            residual = emb_slice
-                            frame_sub_quants = []
-                            n_q_used = min(len(self.quantizer.vq.layers), qv_slice.codes.shape[0])
-                            for i in range(n_q_used):
-                                layer = self.quantizer.vq.layers[i]
-                                quantized, indices, layer_loss = layer(residual)
-                                frame_sub_quants.append(quantized)
-                                residual = residual - quantized.detach()
-                            if frame_sub_quants:
-                                sub_quants_list.append(torch.stack(frame_sub_quants))  # [K, B, D, T_slice]
-                    
-                    # Convert features to [B, T, D] format for consistency computation
-                    # Slice from original audio features
-                    slice_orig_quant_in = slice_original_features["quant_in"].transpose(1, 2)  # [B, T_slice, D]
-                    slice_orig_quant_out = slice_original_features["quant_out"].transpose(1, 2)  # [B, T_slice, D]
-                    
-                    # Slice from perturbed audio features
-                    slice_pert_quant_in = slice_perturbed_features["quant_in"].transpose(1, 2)  # [B, T_slice, D]
-                    slice_pert_quant_out = slice_perturbed_features["quant_out"].transpose(1, 2)  # [B, T_slice, D]
-                    
-                    # Handle sub_quants - convert from [K, B, D, T] to [K, B, T, D]
-                    slice_orig_sub_quants_t = None
-                    if slice_original_sub_quants and len(slice_original_sub_quants) > 0:
-                        slice_orig_sub_quants_t = slice_original_sub_quants[0].transpose(2, 3)  # [K, B, T_slice, D]
-                    
-                    slice_pert_sub_quants_t = None
-                    if slice_perturbed_sub_quants and len(slice_perturbed_sub_quants) > 0:
-                        slice_pert_sub_quants_t = slice_perturbed_sub_quants[0].transpose(2, 3)  # [K, B, T_slice, D]
-                    
-                    # Prepare features dictionary for loss computation
-                    # Compare slice from original vs slice from perturbed (same slice positions)
-                    slice_original_features_dict = {
-                        "quant_in": slice_orig_quant_in,
-                        "quant_out": slice_orig_quant_out,
-                    }
-                    if slice_orig_sub_quants_t is not None:
-                        slice_original_features_dict["sub_quants"] = slice_orig_sub_quants_t
-                    
-                    slice_perturbed_features_dict = {
-                        "quant_in": slice_pert_quant_in,
-                        "quant_out": slice_pert_quant_out,
-                    }
-                    if slice_pert_sub_quants_t is not None:
-                        slice_perturbed_features_dict["sub_quants"] = slice_pert_sub_quants_t
-                    
-                    # Create slice interval for consistency computation
-                    # Both slices are the same length, so we can use a simple interval
-                    from consistency_0 import SliceInterval
-                    slice_feature_lengths = torch.tensor([slice_orig_quant_in.shape[1]] * batch_size, device=emb.device, dtype=torch.long)
-                    slice_interval = SliceInterval(
-                        start_point=start_positions_audio,
-                        end_point=end_positions_audio,
-                        start_split=torch.zeros(batch_size, device=emb.device, dtype=torch.long),
-                        end_split=slice_feature_lengths,
-                        split_interval_lengths=slice_feature_lengths,
-                    )
+                        # Prepare features dictionary for loss computation
+                        # Compare slice from original vs slice from perturbed (same slice positions)
+                        slice_original_features_dict = {
+                            "quant_in": slice_orig_quant_in,
+                            "quant_out": slice_orig_quant_out,
+                        }
+                        if slice_orig_sub_quants_t is not None:
+                            slice_original_features_dict["sub_quants"] = slice_orig_sub_quants_t
+                        
+                        slice_perturbed_features_dict = {
+                            "quant_in": slice_pert_quant_in,
+                            "quant_out": slice_pert_quant_out,
+                        }
+                        if slice_pert_sub_quants_t is not None:
+                            slice_perturbed_features_dict["sub_quants"] = slice_pert_sub_quants_t
+                        
+                        # Create slice interval for consistency computation
+                        # Both slices are the same length, so we can use a simple interval
+                        from consistency_0 import SliceInterval
+                        slice_feature_lengths = torch.tensor([slice_orig_quant_in.shape[1]] * batch_size, device=emb.device, dtype=torch.long)
+                        slice_interval = SliceInterval(
+                            start_point=start_positions_audio,
+                            end_point=end_positions_audio,
+                            start_split=torch.zeros(batch_size, device=emb.device, dtype=torch.long),
+                            end_split=slice_feature_lengths,
+                            split_interval_lengths=slice_feature_lengths,
+                        )
                     
                     # Compute consistency losses using codebook 0 only
                     # Initialize output dictionary
@@ -561,9 +592,9 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         if slice_orig_sub_quants_t.shape[0] > 0:
                             original_slice_q1 = slice_orig_sub_quants_t[0]  # [B, D, T_slice] - first codebook
                     
-                    # Compute augmentation constraint loss: original full vs perturbed full
+                    # Compute augmentation constraint loss: original full vs perturbed full (only if compute_augmentation is True)
                     loss_augmentation_constraint = None
-                    if original_full_q1 is not None and perturbed_full_q1 is not None:
+                    if compute_augmentation and original_full_q1 is not None and perturbed_full_q1 is not None:
                         loss_augmentation_constraint_raw = self.slice_consistency.compute_augmentation_constraint_loss(
                             original_first_codebook=original_full_q1,
                             perturbed_first_codebook=perturbed_full_q1,
@@ -573,9 +604,9 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_augmentation_constraint
                         slice_consistency_output['loss_dict']['augmentation_constraint_loss'] = loss_augmentation_constraint
                     
-                    # Compute slice consistency constraint loss: original full vs original slice
+                    # Compute slice consistency constraint loss: original full vs original slice (only if compute_slice is True)
                     loss_slice_consistency_constraint = None
-                    if original_full_q1 is not None and original_slice_q1 is not None:
+                    if compute_slice and original_full_q1 is not None and original_slice_q1 is not None:
                         # Create slice interval for original full vs original slice
                         from consistency_0 import SliceInterval
                         orig_slice_interval = SliceInterval(
@@ -661,27 +692,30 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         )
                         
                         # Compute slice consistency metric (original full vs original slice) - CODEBOOK 0 ONLY
-                        # Extract only first codebook indices [1, B, T] from [K, B, T]
-                        orig_full_cb0_indices = orig_full_codebook_indices[0:1] if orig_full_codebook_indices is not None else None  # [1, B, T]
-                        slice_orig_cb0_indices = slice_original_codebook_indices[0][0:1] if slice_original_codebook_indices and len(slice_original_codebook_indices) > 0 else None  # [1, B, T_slice]
-                        
-                        slice_consistency_metric = self.slice_consistency.compute_consistency_loss(
-                            full_features=orig_full_features_dict,
-                            slice_features=slice_original_features_dict,
-                            feature_lengths=feature_lengths,
-                            codebook_indices=orig_full_cb0_indices,  # Only codebook 0
-                            slice_codebook_indices=slice_orig_cb0_indices,  # Only codebook 0
-                            slice_interval=orig_slice_interval,
-                        )
-                        
-                        # Store only codebook 0 accuracy metrics
-                        if 'first_codebook_accuracy' in slice_consistency_metric:
-                            slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['first_codebook_accuracy']
-                        elif 'codebook0_accuracy' in slice_consistency_metric:
-                            slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['codebook0_accuracy']
+                        # Only compute if slice features are available (i.e., compute_slice is True)
+                        if slice_original_features_dict is not None:
+                            # Extract only first codebook indices [1, B, T] from [K, B, T]
+                            orig_full_cb0_indices = orig_full_codebook_indices[0:1] if orig_full_codebook_indices is not None else None  # [1, B, T]
+                            slice_orig_cb0_indices = slice_original_codebook_indices[0][0:1] if slice_original_codebook_indices and len(slice_original_codebook_indices) > 0 else None  # [1, B, T_slice]
+                            
+                            slice_consistency_metric = self.slice_consistency.compute_consistency_loss(
+                                full_features=orig_full_features_dict,
+                                slice_features=slice_original_features_dict,
+                                feature_lengths=feature_lengths,
+                                codebook_indices=orig_full_cb0_indices,  # Only codebook 0
+                                slice_codebook_indices=slice_orig_cb0_indices,  # Only codebook 0
+                                slice_interval=orig_slice_interval,
+                            )
+                            
+                            # Store only codebook 0 accuracy metrics
+                            if 'first_codebook_accuracy' in slice_consistency_metric:
+                                slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['first_codebook_accuracy']
+                            elif 'codebook0_accuracy' in slice_consistency_metric:
+                                slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['codebook0_accuracy']
                     
                     # Compute augmentation consistency (original full vs perturbed full) - CODEBOOK 0 ONLY
-                    if original_codebook_indices is not None and full_codebook_indices is not None:
+                    # Only compute if compute_augmentation is True (odd batches)
+                    if compute_augmentation and original_codebook_indices is not None and full_codebook_indices is not None:
                         # Extract only first codebook indices [1, B, T] from [K, B, T]
                         orig_cb0_indices = original_codebook_indices[0:1]  # [1, B, T]
                         pert_cb0_indices = full_codebook_indices[0:1]  # [1, B, T]
@@ -1255,9 +1289,9 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         if slice_orig_sub_quants_t.shape[0] > 0:
                             original_slice_q1 = slice_orig_sub_quants_t[0]  # [B, D, T_slice] - first codebook
                     
-                    # Compute augmentation constraint loss: original full vs perturbed full
+                    # Compute augmentation constraint loss: original full vs perturbed full (only if compute_augmentation is True)
                     loss_augmentation_constraint = None
-                    if original_full_q1 is not None and perturbed_full_q1 is not None:
+                    if compute_augmentation and original_full_q1 is not None and perturbed_full_q1 is not None:
                         loss_augmentation_constraint_raw = self.slice_consistency.compute_augmentation_constraint_loss(
                             original_first_codebook=original_full_q1,
                             perturbed_first_codebook=perturbed_full_q1,
@@ -1267,9 +1301,9 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         slice_consistency_output['loss'] = slice_consistency_output['loss'] + loss_augmentation_constraint
                         slice_consistency_output['loss_dict']['augmentation_constraint_loss'] = loss_augmentation_constraint
                     
-                    # Compute slice consistency constraint loss: original full vs original slice
+                    # Compute slice consistency constraint loss: original full vs original slice (only if compute_slice is True)
                     loss_slice_consistency_constraint = None
-                    if original_full_q1 is not None and original_slice_q1 is not None:
+                    if compute_slice and original_full_q1 is not None and original_slice_q1 is not None:
                         # Create slice interval for original full vs original slice
                         from consistency_0 import SliceInterval
                         orig_slice_interval = SliceInterval(
@@ -1355,27 +1389,30 @@ class EncodecModelWithSliceConsistency(EncodecModel):
                         )
                         
                         # Compute slice consistency metric (original full vs original slice) - CODEBOOK 0 ONLY
-                        # Extract only first codebook indices [1, B, T] from [K, B, T]
-                        orig_full_cb0_indices = orig_full_codebook_indices[0:1] if orig_full_codebook_indices is not None else None  # [1, B, T]
-                        slice_orig_cb0_indices = slice_original_codebook_indices[0][0:1] if slice_original_codebook_indices and len(slice_original_codebook_indices) > 0 else None  # [1, B, T_slice]
-                        
-                        slice_consistency_metric = self.slice_consistency.compute_consistency_loss(
-                            full_features=orig_full_features_dict,
-                            slice_features=slice_original_features_dict,
-                            feature_lengths=feature_lengths,
-                            codebook_indices=orig_full_cb0_indices,  # Only codebook 0
-                            slice_codebook_indices=slice_orig_cb0_indices,  # Only codebook 0
-                            slice_interval=orig_slice_interval,
-                        )
-                        
-                        # Store only codebook 0 accuracy metrics
-                        if 'first_codebook_accuracy' in slice_consistency_metric:
-                            slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['first_codebook_accuracy']
-                        elif 'codebook0_accuracy' in slice_consistency_metric:
-                            slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['codebook0_accuracy']
+                        # Only compute if slice features are available (i.e., compute_slice is True)
+                        if slice_original_features_dict is not None:
+                            # Extract only first codebook indices [1, B, T] from [K, B, T]
+                            orig_full_cb0_indices = orig_full_codebook_indices[0:1] if orig_full_codebook_indices is not None else None  # [1, B, T]
+                            slice_orig_cb0_indices = slice_original_codebook_indices[0][0:1] if slice_original_codebook_indices and len(slice_original_codebook_indices) > 0 else None  # [1, B, T_slice]
+                            
+                            slice_consistency_metric = self.slice_consistency.compute_consistency_loss(
+                                full_features=orig_full_features_dict,
+                                slice_features=slice_original_features_dict,
+                                feature_lengths=feature_lengths,
+                                codebook_indices=orig_full_cb0_indices,  # Only codebook 0
+                                slice_codebook_indices=slice_orig_cb0_indices,  # Only codebook 0
+                                slice_interval=orig_slice_interval,
+                            )
+                            
+                            # Store only codebook 0 accuracy metrics
+                            if 'first_codebook_accuracy' in slice_consistency_metric:
+                                slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['first_codebook_accuracy']
+                            elif 'codebook0_accuracy' in slice_consistency_metric:
+                                slice_consistency_output['slice_consistency_codebook0_accuracy'] = slice_consistency_metric['codebook0_accuracy']
                     
                     # Compute augmentation consistency (original full vs perturbed full) - CODEBOOK 0 ONLY
-                    if original_codebook_indices is not None and full_codebook_indices is not None:
+                    # Only compute if compute_augmentation is True (odd batches)
+                    if compute_augmentation and original_codebook_indices is not None and full_codebook_indices is not None:
                         # Extract only first codebook indices [1, B, T] from [K, B, T]
                         orig_cb0_indices = original_codebook_indices[0:1]  # [1, B, T]
                         pert_cb0_indices = full_codebook_indices[0:1]  # [1, B, T]
