@@ -155,9 +155,22 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             loss_g = loss_g + loss_w_scaled
             
             # Check for NaN before backward
-            if torch.isnan(loss_g) or torch.isnan(loss_w_scaled) or (slice_consistency_output is not None and torch.isnan(loss_slice)):
-                logger.warning(f"NaN detected in losses at batch {idx}: loss_g={loss_g}, loss_w={loss_w_scaled}, loss_slice={loss_slice}")
+            loss_slice_check = slice_consistency_output['loss'] * consistency_weight_factor if slice_consistency_output is not None else None
+            if torch.isnan(loss_g) or torch.isnan(loss_w_scaled) or (loss_slice_check is not None and torch.isnan(loss_slice_check)):
+                logger.warning(f"NaN detected in losses at batch {idx}: loss_g={loss_g}, loss_w={loss_w_scaled}, loss_slice={loss_slice_check}")
                 optimizer.zero_grad()
+                # Clear CUDA cache to free memory from corrupted tensors
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Explicitly delete tensors to free memory
+                try:
+                    del output, loss_w, loss_g, loss_w_scaled, losses_g, logits_real, fmap_real, logits_fake, fmap_fake
+                    if slice_consistency_output is not None:
+                        del slice_consistency_output
+                    if loss_slice_check is not None:
+                        del loss_slice_check
+                except:
+                    pass
                 continue  # Skip this batch
             
             scaler.scale(loss_g).backward()
@@ -202,6 +215,18 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             if torch.isnan(loss_g) or torch.isnan(loss_w_scaled) or (loss_slice is not None and torch.isnan(loss_slice)):
                 logger.warning(f"NaN detected in losses at batch {idx}: loss_g={loss_g}, loss_w={loss_w_scaled}, loss_slice={loss_slice}")
                 optimizer.zero_grad()  # Clear gradients
+                # Clear CUDA cache to free memory from corrupted tensors
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Explicitly delete tensors to free memory
+                try:
+                    del output, loss_w, loss_g, loss_w_scaled, losses_g, logits_real, fmap_real, logits_fake, fmap_fake
+                    if loss_slice is not None:
+                        del loss_slice
+                    if slice_consistency_output is not None:
+                        del slice_consistency_output
+                except NameError:
+                    pass
                 continue  # Skip this batch
             
             # Backward: combine all losses before backward to avoid graph violation
@@ -258,6 +283,11 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                 if torch.isnan(loss_disc):
                     logger.warning(f"NaN detected in discriminator loss at batch {idx}: loss_disc={loss_disc}")
                     optimizer_disc.zero_grad()
+                    # Clear CUDA cache to free memory from corrupted tensors
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # Explicitly delete tensors to free memory
+                    del logits_real, logits_fake, loss_disc
                 else:
                     if config.common.amp: 
                         scaler_disc.scale(loss_disc).backward()
@@ -273,6 +303,24 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                         optimizer_disc.step()
                     
                     accumulated_loss_disc += loss_disc.item()
+                    # Clean up discriminator tensors after use
+                    try:
+                        del logits_real, logits_fake, loss_disc
+                    except NameError:
+                        pass
+
+        # Clean up generator tensors to free memory
+        # Note: Some variables may be in different scopes, so we use try-except
+        try:
+            del output, losses_g
+            if slice_consistency_output is not None:
+                del slice_consistency_output
+        except NameError:
+            pass
+
+        # Periodic memory clearing every 100 batches to prevent accumulation
+        if idx > 0 and idx % 100 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         scheduler.step()
         disc_scheduler.step()
@@ -426,7 +474,8 @@ def _upload_validation_audio_samples(epoch, model, config, wandb_logger):
                 # Reconstruct (use full multi-channel input)
                 with torch.no_grad():
                     if hasattr(model, 'use_slice_consistency') and model.use_slice_consistency:
-                        output, _, _, _ = model(gt_audio, return_slice_consistency=False, batch_idx=0)
+                        # When return_slice_consistency=False, returns (output, loss_w, frames) - 3 values
+                        output, _, _ = model(gt_audio, return_slice_consistency=False, batch_idx=0)
                     else:
                         output = model(gt_audio, batch_idx=0)
                 
@@ -806,7 +855,7 @@ def train(config):
         loaded_epoch = model_checkpoint['epoch']
         
         logger.info(f"✓ Successfully loaded model weights from epoch {loaded_epoch}")
-        logger.info(f"  Starting training from epoch 1 (fresh training with loaded weights)")
+        logger.info(f"  Training will restart from epoch 1 with these loaded weights")
 
     if torch.cuda.is_available():
         model.cuda()
@@ -840,7 +889,7 @@ def train(config):
     scaler_disc = GradScaler() if config.common.amp else None  
 
     # Load optimizer and scheduler states if resuming
-    # (Even though we start from epoch 1, we load optimizer/scheduler states for continuity)
+    # This ensures continuity of optimizer and scheduler states when resuming training
     if config.checkpoint.resume:
         if 'optimizer_state_dict' in model_checkpoint.keys():
             optimizer.load_state_dict(model_checkpoint['optimizer_state_dict'])
@@ -858,26 +907,50 @@ def train(config):
             disc_scheduler.load_state_dict(disc_model_checkpoint['scheduler_state_dict'])
             logger.info(f"✓ Loaded discriminator scheduler state from epoch {loaded_epoch}")
 
-    # Start training from epoch 1 (fresh training with loaded weights)
-    # This allows fresh logging and training continuation
+    # Always start training from epoch 1 (restart epoch counter)
+    # When resuming, we load the weights/optimizer/scheduler states but restart from epoch 1
     start_epoch = 1
+    if config.checkpoint.resume and loaded_epoch > 0:
+        logger.info(f"Resuming training from epoch {start_epoch} with loaded weights from epoch {loaded_epoch}")
+        logger.info(f"  - Model weights: loaded from epoch {loaded_epoch}")
+        logger.info(f"  - Optimizer states: loaded from epoch {loaded_epoch}")
+        logger.info(f"  - Scheduler states: loaded from epoch {loaded_epoch}")
+        logger.info(f"  - Training loop: restarting from epoch {start_epoch}")
+    else:
+        logger.info(f"Starting fresh training from epoch {start_epoch}")
     
     # Instantiate loss balancer
     balancer = Balancer(dict(config.balancer.weights)) if hasattr(config, 'balancer') else None
     if balancer:
         logger.info(f'Loss balancer with weights {balancer.weights} instantiated')
     
+    # Log checkpoint audio samples as epoch 0 before training starts
+    if wandb_logger and config.checkpoint.resume:
+        try:
+            upload_audio_samples = config.get('wandb', {}).get('upload_audio_samples', True)
+            if upload_audio_samples:
+                logger.info("Logging checkpoint audio samples as epoch 0...")
+                model.eval()
+                disc_model.eval()
+                _upload_validation_audio_samples(0, model, config, wandb_logger)
+                logger.info("✓ Successfully logged checkpoint audio samples as epoch 0")
+        except Exception as e:
+            logger.warning(f"Failed to log checkpoint audio samples: {e}")
+            import traceback
+            traceback.print_exc()
+    
     # Training loop
     for epoch in range(start_epoch, config.common.max_epoch + 1):
         # Compute cosine weight factors for this epoch
+        # Weight factors are always computed relative to epoch 1 (original start) to maintain continuity
         # Model weights: start at 1.0, gradually decrease to 0.5
         model_weight_factor = compute_cosine_weight_factor(
-            epoch, start_epoch, config.common.max_epoch, 
+            epoch, 1, config.common.max_epoch, 
             start_weight=1.0, end_weight=0.5
         )
         # Consistency weights: start at 0.1, gradually increase to 1.0
         consistency_weight_factor = compute_cosine_weight_factor(
-            epoch, start_epoch, config.common.max_epoch,
+            epoch, 1, config.common.max_epoch,
             start_weight=0.1, end_weight=1.0
         )
         
