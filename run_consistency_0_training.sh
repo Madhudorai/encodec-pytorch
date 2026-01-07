@@ -30,9 +30,6 @@ echo "✓ Virtual environment activated"
 export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Create output directory if it doesn't exist
-mkdir -p ./checkpoints_eigenscape_consistency_0/
-
 # Run training
 echo "Starting training with codebook 0 consistency..."
 python train_consistency_0.py \

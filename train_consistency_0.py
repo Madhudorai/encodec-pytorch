@@ -6,8 +6,11 @@ import random
 from pathlib import Path
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import tempfile
+import shutil
 
 import hydra
+from hydra.utils import get_original_cwd
 import torch
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
@@ -20,7 +23,7 @@ from losses import disc_loss, total_loss
 from model_consistency_0 import EncodecModelWithSliceConsistency
 from msstftd import MultiScaleSTFTDiscriminator
 from scheduler import WarmupCosineLrScheduler
-from utils import (count_parameters, save_master_checkpoint, set_seed)
+from utils import (count_parameters, save_master_checkpoint, set_seed, save_audio)
 from balancer import Balancer
 from cal_metrics import calculate_si_snr
 
@@ -151,7 +154,16 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             
             loss_g = loss_g + loss_w_scaled
             
-            scaler.scale(loss_g).backward()  
+            # Check for NaN before backward
+            if torch.isnan(loss_g) or torch.isnan(loss_w_scaled) or (slice_consistency_output is not None and torch.isnan(loss_slice)):
+                logger.warning(f"NaN detected in losses at batch {idx}: loss_g={loss_g}, loss_w={loss_w_scaled}, loss_slice={loss_slice}")
+                optimizer.zero_grad()
+                continue  # Skip this batch
+            
+            scaler.scale(loss_g).backward()
+            # Gradient clipping (unscale first, then clip, then scale again)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)  
             scaler.update()  
         else:
@@ -186,11 +198,20 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                     # loss_g is tensor, add loss_slice tensor
                     loss_g = loss_g + loss_slice
             
+            # Check for NaN before backward
+            if torch.isnan(loss_g) or torch.isnan(loss_w_scaled) or (loss_slice is not None and torch.isnan(loss_slice)):
+                logger.warning(f"NaN detected in losses at batch {idx}: loss_g={loss_g}, loss_w={loss_w_scaled}, loss_slice={loss_slice}")
+                optimizer.zero_grad()  # Clear gradients
+                continue  # Skip this batch
+            
             # Backward: combine all losses before backward to avoid graph violation
             if balancer is None:
                 # Combine all losses (loss_g, loss_w_scaled, loss_slice) and backward once
                 combined_loss = loss_g + loss_w_scaled
                 combined_loss.backward()
+                
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             else:
                 # Balancer already backwarded on output, so we need to backward
                 # loss_w_scaled and loss_slice separately with retain_graph=True
@@ -198,6 +219,9 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                 loss_w_scaled.backward(retain_graph=True)
                 if loss_slice is not None:
                     loss_slice.backward(retain_graph=True)
+                
+                # Gradient clipping for model parameters
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
 
@@ -229,16 +253,27 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
                 logits_real, _ = disc_model(input_wav_reshaped)
                 logits_fake, _ = disc_model(output_reshaped.detach())
                 loss_disc = disc_loss(logits_real, logits_fake)
-            if config.common.amp: 
-                scaler_disc.scale(loss_disc).backward()
-                scaler_disc.step(optimizer_disc)  
-                scaler_disc.update()  
-            else:
-                loss_disc.backward() 
-                optimizer_disc.step()
+                
+                # Check for NaN in discriminator loss
+                if torch.isnan(loss_disc):
+                    logger.warning(f"NaN detected in discriminator loss at batch {idx}: loss_disc={loss_disc}")
+                    optimizer_disc.zero_grad()
+                else:
+                    if config.common.amp: 
+                        scaler_disc.scale(loss_disc).backward()
+                        # Gradient clipping (unscale first, then clip)
+                        scaler_disc.unscale_(optimizer_disc)
+                        torch.nn.utils.clip_grad_norm_(disc_model.parameters(), max_norm=1.0)
+                        scaler_disc.step(optimizer_disc)  
+                        scaler_disc.update()  
+                    else:
+                        loss_disc.backward()
+                        # Gradient clipping for discriminator
+                        torch.nn.utils.clip_grad_norm_(disc_model.parameters(), max_norm=1.0)
+                        optimizer_disc.step()
+                    
+                    accumulated_loss_disc += loss_disc.item()
 
-            accumulated_loss_disc += loss_disc.item()
-        
         scheduler.step()
         disc_scheduler.step()
 
@@ -283,6 +318,179 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         if config.model.train_discriminator and epoch >= config.lr_scheduler.warmup_epoch:
             log_dict['train/loss_disc'] = avg_loss_disc
         wandb_logger.log(log_dict)
+
+
+def _upload_validation_audio_samples(epoch, model, config, wandb_logger):
+    """Upload validation audio samples (ground truth and reconstructed) to WandB.
+    
+    Uses 3 fixed demo folder audios, reconstructs at different bandwidths,
+    and uploads as WandB tables and artifacts.
+    """
+    logger.info("Generating validation audio samples for WandB upload...")
+    
+    # Use demo folder - same 3 audios every epoch
+    # With Hydra, cwd is changed to outputs/YYYY-MM-DD/HH-MM-SS/
+    # Use get_original_cwd() to get the project root directory
+    if hasattr(config, 'demo_dir'):
+        demo_dir_str = config.demo_dir
+    elif 'demo_dir' in config:
+        demo_dir_str = config['demo_dir']
+    else:
+        demo_dir_str = './demo'
+    
+    # Convert to Path and resolve to absolute path
+    demo_dir = Path(demo_dir_str)
+    if not demo_dir.is_absolute():
+        # Resolve relative to original project root (not Hydra outputs directory)
+        original_cwd = Path(get_original_cwd())
+        demo_dir = original_cwd / demo_dir
+    demo_dir = demo_dir.resolve()  # Resolve any '..' or '.' in path
+    
+    if not demo_dir.exists():
+        logger.warning(f"Demo directory not found: {demo_dir}. Skipping audio upload.")
+        return
+    
+    logger.info(f"Using demo directory: {demo_dir}")
+    
+    # Find all demo folders and select first 3 (same every epoch)
+    demo_folders = sorted([f for f in demo_dir.iterdir() if f.is_dir() and f.name != "README.md"])[:3]
+    
+    if len(demo_folders) == 0:
+        logger.warning(f"No demo folders found in {demo_dir}. Skipping audio upload.")
+        return
+    
+    logger.info(f"Using {len(demo_folders)} demo folders: {[f.name for f in demo_folders]}")
+    
+    # Test all bandwidths
+    sample_bandwidths = config.model.target_bandwidths
+    
+    # Create temporary directory for audio files
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"val_audio_epoch{epoch}_"))
+    
+    try:
+        # Create listening table (no spectrogram column)
+        listening_table = wandb.Table(columns=["demo_folder", "bandwidth", "type", "audio", "si_snr"])
+        
+        from utils import convert_audio
+        
+        for demo_folder in demo_folders:
+            # Find ground truth audio file
+            gt_files = list(demo_folder.glob("*_gt.wav"))
+            if not gt_files:
+                logger.warning(f"No ground truth file found in {demo_folder.name}, skipping...")
+                continue
+            
+            gt_file = gt_files[0]
+            logger.info(f"Processing {demo_folder.name}: {gt_file.name}")
+            
+            # Load ground truth audio
+            wav, sr = torchaudio.load(gt_file)
+            
+            # Convert audio to model format
+            wav = convert_audio(wav, sr, config.model.sample_rate, model.channels)
+            # Add batch dimension: [C, T] -> [1, C, T]
+            gt_audio = wav.unsqueeze(0)
+            
+            if torch.cuda.is_available():
+                gt_audio = gt_audio.cuda()
+            
+            # For multi-channel, take first channel for audio upload
+            B, C, T = gt_audio.shape
+            if C > 1:
+                gt_audio_mono = gt_audio[:, 0:1, :]  # [1, 1, T]
+            else:
+                gt_audio_mono = gt_audio
+            
+            # Save ground truth audio (move to CPU first)
+            gt_path = temp_dir / f"{demo_folder.name}_gt.wav"
+            save_audio(gt_audio_mono.squeeze(0).cpu(), gt_path, config.model.sample_rate, rescale=True)
+            
+            # Load ground truth for SI-SNR calculation
+            gt_audio_np = gt_audio_mono.squeeze(0).cpu().numpy()
+            if len(gt_audio_np.shape) > 1:
+                gt_audio_np = gt_audio_np[0] if gt_audio_np.shape[0] < gt_audio_np.shape[-1] else gt_audio_np.flatten()
+            
+            # Add ground truth row
+            listening_table.add_data(
+                demo_folder.name,
+                "N/A",
+                "ground_truth",
+                wandb.Audio(str(gt_path), sample_rate=config.model.sample_rate),
+                "N/A"
+            )
+            
+            # Reconstruct at different bandwidths
+            for bandwidth in sample_bandwidths:
+                model.bandwidth = bandwidth
+                
+                # Reconstruct (use full multi-channel input)
+                with torch.no_grad():
+                    if hasattr(model, 'use_slice_consistency') and model.use_slice_consistency:
+                        output, _, _, _ = model(gt_audio, return_slice_consistency=False, batch_idx=0)
+                    else:
+                        output = model(gt_audio, batch_idx=0)
+                
+                # For multi-channel, take first channel for audio upload
+                if C > 1:
+                    output_mono = output[:, 0:1, :]  # [1, 1, T]
+                else:
+                    output_mono = output
+                
+                # Save reconstructed audio (move to CPU first)
+                recon_path = temp_dir / f"{demo_folder.name}_bw_{bandwidth}.wav"
+                save_audio(output_mono.squeeze(0).cpu(), recon_path, config.model.sample_rate, rescale=True)
+                
+                # Calculate SI-SNR
+                try:
+                    recon_audio_np = output_mono.squeeze(0).cpu().numpy()
+                    if len(recon_audio_np.shape) > 1:
+                        recon_audio_np = recon_audio_np[0] if recon_audio_np.shape[0] < recon_audio_np.shape[-1] else recon_audio_np.flatten()
+                    si_snr_value = calculate_si_snr(gt_audio_np, recon_audio_np)
+                except Exception as e:
+                    si_snr_value = None
+                    logger.warning(f"Failed to calculate SI-SNR for {demo_folder.name} at {bandwidth} kbps: {e}")
+                
+                # Add reconstructed row
+                listening_table.add_data(
+                    demo_folder.name,
+                    f"{bandwidth}",
+                    "reconstructed",
+                    wandb.Audio(str(recon_path), sample_rate=config.model.sample_rate),
+                    f"{si_snr_value:.2f}" if si_snr_value is not None else "N/A"
+                )
+        
+        # Log listening table
+        wandb_logger.log({f"val/listening_table_epoch_{epoch}": listening_table})
+        logger.info(f"✓ Logged listening table with {len(listening_table.data)} rows")
+        
+        # Create and upload artifact
+        artifact = wandb.Artifact(f"validation_audio_epoch_{epoch}", type="audio_samples")
+        
+        # Add all audio files to artifact
+        for audio_file in temp_dir.glob("*.wav"):
+            artifact.add_file(str(audio_file))
+        
+        # Upload artifact with timeout
+        def upload_artifact():
+            wandb_logger.log_artifact(artifact)
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(upload_artifact)
+            try:
+                future.result(timeout=120)  # 2 minute timeout
+                logger.info(f"✓ Successfully uploaded validation audio artifact for epoch {epoch}")
+            except FutureTimeoutError:
+                logger.warning(f"⚠ Wandb artifact upload timed out for epoch {epoch}. Continuing...")
+                future.cancel()
+            except Exception as e:
+                logger.warning(f"⚠ Wandb artifact upload failed for epoch {epoch}: {e}. Continuing...")
+    
+    finally:
+        # Clean up temporary directory
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp directory {temp_dir}: {e}")
 
 
 @torch.no_grad()
@@ -452,6 +660,17 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                     val_log_dict[f'val/inter_channel_consistency_codebook0_bw_{bandwidth}'] = avg_inter_cb0
         
         wandb_logger.log(val_log_dict)
+        
+        # Upload audio samples and artifacts during validation
+        # Use 3 fixed demo folder audios (same every epoch)
+        try:
+            upload_audio_samples = config.get('wandb', {}).get('upload_audio_samples', True)
+            if upload_audio_samples:
+                _upload_validation_audio_samples(epoch, model, config, wandb_logger)
+        except Exception as e:
+            logger.warning(f"Failed to upload validation audio samples: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def train(config):

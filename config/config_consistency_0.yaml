@@ -4,7 +4,7 @@ common:
   log_interval: 100
   max_epoch: 200
   seed: 3401
-  amp: False
+  amp: False   
 
 datasets:
   # Eigenscape dataset configuration
@@ -15,8 +15,8 @@ datasets:
   
   batch_size: 4  # Reduced from 8 to fit GPU memory with consistency training (effective batch_size=8 with 2 channels)
   tensor_cut: 24000  # 1 second at 24kHz
-  num_workers: 4
-  fixed_length: 10000  # 10k samples per epoch (10000 / 4 batch_size = 2500 batches per epoch)
+  num_workers: 8  # Increased from 4 for faster data loading (if CPU allows)
+  fixed_length: 8000  # 8k samples per epoch (8000 / 4 batch_size = 2000 batches per epoch) 
   pin_memory: False  # Disable to save memory
 
 checkpoint:
@@ -99,4 +99,8 @@ wandb:
   enabled: True
   project: 'eigenscape-encodec-consistency-0'
   name: 'eigenscape_consistency_0_bs4_epochs200_24khz'
-  upload_artifacts: False   
+  upload_artifacts: False  # Disable checkpoint artifact uploads (saves time)
+  upload_audio_samples: True  # Upload validation audio samples during validation (every 5 epochs)
+
+# Demo directory for validation audio samples
+demo_dir: './demo'  # Path to demo folder with ground truth audio files   

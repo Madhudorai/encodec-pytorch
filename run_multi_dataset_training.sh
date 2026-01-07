@@ -29,9 +29,6 @@ echo "✓ Virtual environment activated"
 export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Create output directory if it doesn't exist
-mkdir -p ./checkpoints_multi_dataset/
-
 # Run training
 echo "Starting training..."
 python train_multi_dataset.py \
