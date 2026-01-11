@@ -13,6 +13,26 @@ datasets:
   eigenscape_valid_folders: ['Train Station', Woodland]
   num_channels_to_load: 2  # Number of random channels to load from each 32-channel file
   
+  # Spatial audio datasets (STARSS, DCASE, LOCATA, MARCO)
+  # CSV files should be generated using: python datasets/generate_spatial_dataset_csvs.py
+  spatial_data_base_path: '/scratch/spatial_audio_data'
+  starss_train_csv: '/scratch/spatial_audio_data/csvs/starss_train.csv'
+  starss_valid_csv: '/scratch/spatial_audio_data/csvs/starss_val.csv'  # May be empty if no val split
+  starss_test_csv: '/scratch/spatial_audio_data/csvs/starss_test.csv'
+  
+  dcase_train_csv: '/scratch/spatial_audio_data/csvs/dcase_train.csv'
+  dcase_valid_csv: '/scratch/spatial_audio_data/csvs/dcase_val.csv'
+  dcase_test_csv: '/scratch/spatial_audio_data/csvs/dcase_test.csv'
+  
+  aug_locata_train_csv: '/scratch/spatial_audio_data/csvs/aug_locata_train.csv'
+  aug_locata_valid_csv: '/scratch/spatial_audio_data/csvs/aug_locata_val.csv'
+  aug_locata_test_csv: '/scratch/spatial_audio_data/csvs/aug_locata_test.csv'
+  
+  aug_marco_train_csv: '/scratch/spatial_audio_data/csvs/aug_marco_train.csv'
+  aug_marco_valid_csv: '/scratch/spatial_audio_data/csvs/aug_marco_val.csv'
+  aug_marco_test_csv: '/scratch/spatial_audio_data/csvs/aug_marco_test.csv'
+  
+
   batch_size: 4  # Reduced from 8 to fit GPU memory with consistency training (effective batch_size=8 with 2 channels)
   tensor_cut: 24000  # 1 second at 24kHz
   num_workers: 8  # Increased from 4 for faster data loading (if CPU allows)
@@ -23,7 +43,7 @@ checkpoint:
   resume: True
   checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-10-21/23-31-14/checkpoints_multi_dataset/bs16_cut24000_length32000_epoch300_lr0.0003.pt'
   disc_checkpoint_path: '/user/i/iran/encodec-pytorch/outputs/2025-10-21/23-31-14/checkpoints_multi_dataset/bs16_cut24000_length32000_epoch300_disc_lr0.0003.pt'
-  save_folder: './checkpoints_eigenscape_consistency_0/'
+  save_folder: './checkpoints_eigenscape_spatial_consistency/'
   save_location: '${checkpoint.save_folder}/bs${datasets.batch_size}_cut${datasets.tensor_cut}_length${datasets.fixed_length}_' 
 
 optimization:
@@ -47,7 +67,7 @@ model:
   causal: True
   norm: 'weight_norm'
   segment: None
-  name: 'eigenscape_encodec_consistency_0'
+  name: 'eigenscape_encodec_spatial_consistency'
   
   # Slice consistency configuration (intra-channel)
   slice_consistency:
@@ -72,7 +92,7 @@ model:
     perturb_all_audio: true  # Apply perturbations to full audio
     perturb_slice_audio: true  # Apply perturbations to slice audio
 
-  # Inter-channel consistency configuration
+  # Inter-channel consistency configuration (spatial consistency)
   inter_channel_consistency:
     enabled: True
     codebook_index: 0  # Only compare codebook 0 between channels
@@ -97,10 +117,11 @@ balancer:
 # Weights & Biases configuration
 wandb:
   enabled: True
-  project: 'eigenscape-encodec-consistency-0'
-  name: 'eigenscape_consistency_0_bs4_epochs200_24khz'
+  project: 'eigenscape-encodec-spatial-consistency'
+  name: 'eigenscape_spatial_consistency_bs4_epochs200_24khz'
   upload_artifacts: False  # Disable checkpoint artifact uploads (saves time)
   upload_audio_samples: True  # Upload validation audio samples during validation (every 5 epochs)
 
 # Demo directory for validation audio samples
 demo_dir: './demo'  # Path to demo folder with ground truth audio files   
+

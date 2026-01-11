@@ -47,36 +47,58 @@ class MultiDataset(torch.utils.data.Dataset):
         """Load audio files from multiple datasets based on mode."""
         audio_files = []
         
-        # Define dataset configurations
+        # Define mono dataset configurations (always available)
         datasets_config = {
             'jamendo': {
-                'train': self.config.datasets.jamendo_train_csv,
-                'val': self.config.datasets.jamendo_valid_csv,
-                'test': self.config.datasets.jamendo_test_csv
+                'train': getattr(self.config.datasets, 'jamendo_train_csv', None),
+                'val': getattr(self.config.datasets, 'jamendo_valid_csv', None),
+                'test': getattr(self.config.datasets, 'jamendo_test_csv', None)
             },
             'common_voice': {
-                'train': self.config.datasets.common_voice_train_csv,
-                'val': self.config.datasets.common_voice_valid_csv,
-                'test': self.config.datasets.common_voice_test_csv
+                'train': getattr(self.config.datasets, 'common_voice_train_csv', None),
+                'val': getattr(self.config.datasets, 'common_voice_valid_csv', None),
+                'test': getattr(self.config.datasets, 'common_voice_test_csv', None)
             },
             'fsd50k': {
-                'train': self.config.datasets.fsd50k_train_csv,
-                'val': self.config.datasets.fsd50k_valid_csv,
-                'test': self.config.datasets.fsd50k_test_csv
+                'train': getattr(self.config.datasets, 'fsd50k_train_csv', None),
+                'val': getattr(self.config.datasets, 'fsd50k_valid_csv', None),
+                'test': getattr(self.config.datasets, 'fsd50k_test_csv', None)
             },
             'dns_challenge4': {
-                'train': self.config.datasets.dns_challenge4_train_csv,
-                'val': self.config.datasets.dns_challenge4_valid_csv,
-                'test': self.config.datasets.dns_challenge4_test_csv
+                'train': getattr(self.config.datasets, 'dns_challenge4_train_csv', None),
+                'val': getattr(self.config.datasets, 'dns_challenge4_valid_csv', None),
+                'test': getattr(self.config.datasets, 'dns_challenge4_test_csv', None)
             }
         }
         
-        # Add more datasets as needed
-        # datasets_config['librispeech'] = {
-        #     'train': self.config.datasets.librispeech_train_csv,
-        #     'val': self.config.datasets.librispeech_valid_csv,
-        #     'test': self.config.datasets.librispeech_test_csv
-        # }
+        # Add spatial datasets only if CSV paths are configured
+        spatial_datasets = {
+            'starss': {
+                'train': getattr(self.config.datasets, 'starss_train_csv', None),
+                'val': getattr(self.config.datasets, 'starss_valid_csv', None),
+                'test': getattr(self.config.datasets, 'starss_test_csv', None)
+            },
+            'dcase': {
+                'train': getattr(self.config.datasets, 'dcase_train_csv', None),
+                'val': getattr(self.config.datasets, 'dcase_valid_csv', None),
+                'test': getattr(self.config.datasets, 'dcase_test_csv', None)
+            },
+            'aug_locata': {
+                'train': getattr(self.config.datasets, 'aug_locata_train_csv', None),
+                'val': getattr(self.config.datasets, 'aug_locata_valid_csv', None),
+                'test': getattr(self.config.datasets, 'aug_locata_test_csv', None)
+            },
+            'aug_marco': {
+                'train': getattr(self.config.datasets, 'aug_marco_train_csv', None),
+                'val': getattr(self.config.datasets, 'aug_marco_valid_csv', None),
+                'test': getattr(self.config.datasets, 'aug_marco_test_csv', None)
+            }
+        }
+        
+        # Only add spatial datasets if at least one CSV path is configured
+        for dataset_name, csv_paths in spatial_datasets.items():
+            if any(csv_paths.values()):  # If any CSV path is configured
+                datasets_config[dataset_name] = csv_paths
         
         # Load files from each dataset
         for dataset_name, csv_paths in datasets_config.items():
@@ -94,7 +116,8 @@ class MultiDataset(torch.utils.data.Dataset):
                         logger.warning(f"Empty CSV file: {csv_path}")
                 except Exception as e:
                     logger.warning(f"Failed to load {dataset_name} {self.mode}: {e}")
-            else:
+            elif csv_path:
+                # CSV path is configured but file doesn't exist
                 logger.warning(f"CSV file not found: {csv_path}")
         
         if len(audio_files) == 0:
@@ -104,12 +127,23 @@ class MultiDataset(torch.utils.data.Dataset):
 
     def _organize_files_by_dataset(self):
         """Organize audio files by dataset for mixing strategies."""
+        # Start with mono datasets (always included)
         dataset_files = {
             'jamendo': [],
             'common_voice': [],
             'fsd50k': [],
             'dns_challenge4': []
         }
+        
+        # Only add spatial datasets if they're configured in the config
+        spatial_datasets = ['starss', 'dcase', 'aug_locata', 'aug_marco']
+        for dataset_name in spatial_datasets:
+            # Check if any CSV path for this dataset is configured
+            train_csv = getattr(self.config.datasets, f'{dataset_name}_train_csv', None)
+            val_csv = getattr(self.config.datasets, f'{dataset_name}_valid_csv', None)
+            test_csv = getattr(self.config.datasets, f'{dataset_name}_test_csv', None)
+            if train_csv or val_csv or test_csv:
+                dataset_files[dataset_name] = []
         
         for file_path in self.audio_files:
             dataset_name = self._get_dataset_name(file_path)
@@ -164,21 +198,55 @@ class MultiDataset(torch.utils.data.Dataset):
 
     def _get_dataset_name(self, file_path):
         """Extract dataset name from file path."""
-        if 'jamendo' in file_path.lower():
+        file_path_lower = file_path.lower()
+        
+        # Check if spatial datasets are configured before checking for them
+        has_spatial_datasets = any([
+            getattr(self.config.datasets, 'starss_train_csv', None),
+            getattr(self.config.datasets, 'dcase_train_csv', None),
+            getattr(self.config.datasets, 'aug_locata_train_csv', None),
+            getattr(self.config.datasets, 'aug_marco_train_csv', None)
+        ])
+        
+        # Spatial audio datasets (check first as they may have overlapping names)
+        # Only check if spatial datasets are configured
+        if has_spatial_datasets:
+            if 'aug_marco' in file_path_lower or '/aug_marco/' in file_path_lower:
+                return 'aug_marco'
+            elif 'aug_locata' in file_path_lower or '/aug_locata/' in file_path_lower:
+                return 'aug_locata'
+            elif 'starss' in file_path_lower or '/starss/' in file_path_lower:
+                return 'starss'
+            elif 'dcase' in file_path_lower or '/dcase/' in file_path_lower:
+                return 'dcase'
+        
+        # Regular mono datasets
+        if 'jamendo' in file_path_lower:
             return 'jamendo'
-        elif 'common_voice' in file_path.lower() or 'commonvoice' in file_path.lower():
+        elif 'common_voice' in file_path_lower or 'commonvoice' in file_path_lower:
             return 'common_voice'
-        elif 'fsd50k' in file_path.lower():
+        elif 'fsd50k' in file_path_lower:
             return 'fsd50k'
-        elif 'dns_challenge4' in file_path.lower() or 'dns' in file_path.lower():
+        elif 'dns_challenge4' in file_path_lower or ('dns' in file_path_lower and 'challenge' in file_path_lower):
             return 'dns_challenge4'
-        elif 'librispeech' in file_path.lower():
+        elif 'librispeech' in file_path_lower:
             return 'librispeech'
         else:
             return 'unknown'
 
-    def _load_audio_segment(self, audio_path, duration=1.0):
-        """Load a random 1-second segment from an audio file."""
+    def _load_audio_segment(self, audio_path, duration=1.0, selected_channels=None):
+        """Load a random 1-second segment from an audio file.
+        
+        Args:
+            audio_path: Path to audio file
+            duration: Duration in seconds
+            selected_channels: Optional list of channel indices to select (for multi-channel audio)
+                              If None and audio has more channels than self.channels, randomly selects channels
+        
+        Returns:
+            waveform: Audio tensor [self.channels, T]
+            selected_channels: List of channel indices that were selected
+        """
         try:
             # Get file info to determine duration
             import soundfile as sf
@@ -189,20 +257,39 @@ class MultiDataset(torch.utils.data.Dataset):
             max_start_time = max(0, file_duration - duration)
             start_time = random.uniform(0, max_start_time)
             
-            # Load the segment
+            # Load the segment - always load as multi-channel to preserve spatial information
             waveform, sample_rate = librosa.load(
                 audio_path,
                 sr=self.sample_rate,
-                mono=self.channels == 1,
+                mono=False,  # Always load multi-channel for spatial datasets
                 offset=start_time,
                 duration=duration
             )
             
-            # Convert to tensor and add channel dimension if needed
-            waveform = torch.as_tensor(waveform)
+            # Convert to tensor
+            waveform = torch.as_tensor(waveform)  # [C, T] or [T] if mono
+            
+            # Handle channel selection for multi-channel audio (like Eigenscape)
             if len(waveform.shape) == 1:
-                waveform = waveform.unsqueeze(0)
-                waveform = waveform.expand(self.channels, -1)
+                # Mono audio: expand to desired number of channels
+                waveform = waveform.unsqueeze(0)  # [1, T]
+                if self.channels > 1:
+                    waveform = waveform.expand(self.channels, -1)  # [C, T]
+                selected_channels = list(range(self.channels))  # [0, 1, ...]
+            elif waveform.shape[0] > self.channels:
+                # More channels than needed: randomly select channels (like Eigenscape)
+                if selected_channels is None:
+                    selected_channels = random.sample(range(waveform.shape[0]), self.channels)
+                waveform = waveform[selected_channels, :]  # [self.channels, T]
+            elif waveform.shape[0] < self.channels:
+                # Fewer channels than needed: expand by repeating
+                selected_channels = list(range(waveform.shape[0]))  # Use available channels
+                waveform = waveform.expand(self.channels, -1)  # [self.channels, T]
+                # Update selected_channels to indicate which channels were used
+                selected_channels = list(range(self.channels))  # All channels used (some repeated)
+            else:
+                # waveform.shape[0] == self.channels, use as-is
+                selected_channels = list(range(self.channels))
             
             # Ensure exact length to avoid tensor size mismatches
             target_length = int(self.sample_rate * duration)
@@ -212,12 +299,13 @@ class MultiDataset(torch.utils.data.Dataset):
                 padding = torch.zeros(self.channels, target_length - waveform.shape[1])
                 waveform = torch.cat([waveform, padding], dim=1)
             
-            return waveform
+            return waveform, selected_channels
             
         except Exception as e:
             logger.warning(f"Failed to load segment from {audio_path}: {e}")
             # Return silence if loading fails
-            return torch.zeros(self.channels, int(self.sample_rate * duration))
+            selected_channels = list(range(self.channels))
+            return torch.zeros(self.channels, int(self.sample_rate * duration)), selected_channels
 
     def _normalize_audio(self, waveform):
         """Normalize audio by file (per-file normalization)."""
@@ -254,12 +342,12 @@ class MultiDataset(torch.utils.data.Dataset):
             # Single source from Jamendo (probability 0.32)
             if len(self.dataset_files['jamendo']) > 0:
                 audio_path = random.choice(self.dataset_files['jamendo'])
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
             else:
                 # Fallback to any available dataset
                 all_files = [f for files in self.dataset_files.values() for f in files]
                 audio_path = random.choice(all_files)
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
         
         elif strategy == 's2':
             # Single source from other datasets (probability 0.10 each)
@@ -269,12 +357,12 @@ class MultiDataset(torch.utils.data.Dataset):
             if available_datasets:
                 dataset = random.choice(available_datasets)
                 audio_path = random.choice(self.dataset_files[dataset])
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
             else:
                 # Fallback to any available dataset
                 all_files = [f for files in self.dataset_files.values() for f in files]
                 audio_path = random.choice(all_files)
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
         
         elif strategy == 's3':
             # Mix two sources from all datasets (probability 0.24)
@@ -282,13 +370,13 @@ class MultiDataset(torch.utils.data.Dataset):
             if len(all_files) >= 2:
                 # Sample two different files
                 audio_paths = random.sample(all_files, 2)
-                waveform1 = self._load_audio_segment(audio_paths[0])
-                waveform2 = self._load_audio_segment(audio_paths[1])
+                waveform1, _ = self._load_audio_segment(audio_paths[0])
+                waveform2, _ = self._load_audio_segment(audio_paths[1])
                 waveform = waveform1 + waveform2
             else:
                 # Fallback to single source
                 audio_path = random.choice(all_files)
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
         
         elif strategy == 's4':
             # Mix three sources from all datasets except music (probability 0.12)
@@ -299,21 +387,21 @@ class MultiDataset(torch.utils.data.Dataset):
             if len(non_music_files) >= 3:
                 # Sample three different files
                 audio_paths = random.sample(non_music_files, 3)
-                waveform1 = self._load_audio_segment(audio_paths[0])
-                waveform2 = self._load_audio_segment(audio_paths[1])
-                waveform3 = self._load_audio_segment(audio_paths[2])
+                waveform1, _ = self._load_audio_segment(audio_paths[0])
+                waveform2, _ = self._load_audio_segment(audio_paths[1])
+                waveform3, _ = self._load_audio_segment(audio_paths[2])
                 waveform = waveform1 + waveform2 + waveform3
             elif len(non_music_files) >= 2:
                 # Fallback to two sources
                 audio_paths = random.sample(non_music_files, 2)
-                waveform1 = self._load_audio_segment(audio_paths[0])
-                waveform2 = self._load_audio_segment(audio_paths[1])
+                waveform1, _ = self._load_audio_segment(audio_paths[0])
+                waveform2, _ = self._load_audio_segment(audio_paths[1])
                 waveform = waveform1 + waveform2
             else:
                 # Fallback to single source
                 all_files = [f for files in self.dataset_files.values() for f in files]
                 audio_path = random.choice(all_files)
-                waveform = self._load_audio_segment(audio_path)
+                waveform, _ = self._load_audio_segment(audio_path)
         
         # Apply normalization and random gain
         waveform = self._normalize_audio(waveform)
@@ -339,6 +427,7 @@ class MultiDataset(torch.utils.data.Dataset):
                 # Use mixing strategy for validation
                 waveform = self._get_mixed_audio()
                 sample_rate = self.sample_rate
+                selected_channels = list(range(self.channels))  # Default for mixed audio
             # For test, use fixed segments (no mixing)
             elif self.mode == 'test' and hasattr(self, 'fixed_segments'):
                 segment = self.fixed_segments[idx % len(self.fixed_segments)]
@@ -346,34 +435,25 @@ class MultiDataset(torch.utils.data.Dataset):
                 start_time = segment['start_time']
                 sample_rate = segment['sample_rate']
                 
-                # Load specific segment
-                waveform, sample_rate = librosa.load(
-                    audio_path,
-                    sr=self.sample_rate,
-                    mono=self.channels == 1,
-                    offset=start_time,
-                    duration=1.0  # 1 second
-                )
-                
-                # Add channel dimension if loaded audio was mono
-                waveform = torch.as_tensor(waveform)
-                if len(waveform.shape) == 1:
-                    waveform = waveform.unsqueeze(0)
-                    waveform = waveform.expand(self.channels, -1)
+                # Load specific segment using the same logic as _load_audio_segment
+                waveform, selected_channels = self._load_audio_segment(audio_path, duration=1.0)
+                sample_rate = self.sample_rate
             else:
                 # For training, use mixing strategy
                 waveform = self._get_mixed_audio()
                 sample_rate = self.sample_rate
+                selected_channels = list(range(self.channels))  # Default for mixed audio
                 
         except (audioread.exceptions.NoBackendError, ZeroDivisionError, FileNotFoundError) as e:
             logger.warning(f"Not able to load audio: {e}")
             # Return a random sample instead
             return self[random.randint(0, len(self) - 1)]
 
-        return waveform, sample_rate
+        # Return waveform [C, T], sample_rate, and selected_channels (for compatibility with EigenscapeDataset)
+        return waveform, sample_rate, selected_channels
 
     def __getitem__(self, idx):
-        waveform, sample_rate = self.get(idx)
+        waveform, sample_rate, selected_channels = self.get(idx)
 
         if self.transform:
             waveform = self.transform(waveform)
@@ -382,16 +462,16 @@ class MultiDataset(torch.utils.data.Dataset):
             if waveform.size()[1] > self.tensor_cut:
                 start = random.randint(0, waveform.size()[1] - self.tensor_cut - 1)
                 waveform = waveform[:, start:start + self.tensor_cut]
-                return waveform, sample_rate
+                return waveform, sample_rate, selected_channels
             else:
                 # If audio is shorter than tensor_cut, pad with zeros
                 if waveform.size()[1] < self.tensor_cut:
                     padding_size = self.tensor_cut - waveform.size()[1]
                     padding = torch.zeros(waveform.size()[0], padding_size)
                     waveform = torch.cat([waveform, padding], dim=1)
-                return waveform, sample_rate
+                return waveform, sample_rate, selected_channels
 
-        return waveform, sample_rate
+        return waveform, sample_rate, selected_channels
 
 
 def pad_sequence(batch):
@@ -403,11 +483,28 @@ def pad_sequence(batch):
 
 
 def collate_fn(batch):
-    """Collate function for the dataloader."""
-    tensors = []
-    for waveform, _ in batch:
-        tensors += [waveform]
+    """Collate function for the dataloader.
     
-    # Group the list of tensors into a batched tensor
-    tensors = pad_sequence(tensors)
-    return tensors
+    Handles both formats:
+    - (waveform, sample_rate) - old format
+    - (waveform, sample_rate, selected_channels) - new format (compatible with EigenscapeDataset)
+    """
+    # Check format by looking at first item
+    if len(batch[0]) == 3:
+        # New format: (waveform, sample_rate, selected_channels)
+        waveforms = [item[0] for item in batch]
+        sample_rates = [item[1] for item in batch]
+        selected_channels_list = [item[2] for item in batch]
+        
+        # Pad sequences
+        tensors = pad_sequence(waveforms)
+        return tensors, sample_rates, selected_channels_list
+    else:
+        # Old format: (waveform, sample_rate)
+        tensors = []
+        for waveform, _ in batch:
+            tensors += [waveform]
+        
+        # Group the list of tensors into a batched tensor
+        tensors = pad_sequence(tensors)
+        return tensors

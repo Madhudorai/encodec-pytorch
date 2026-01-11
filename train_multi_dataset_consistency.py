@@ -17,8 +17,8 @@ from torch.cuda.amp import GradScaler, autocast
 import torchaudio
 import wandb
 
-import eigenscape_dataset as data
-from eigenscape_dataset import collate_fn
+import multi_dataset as data
+from multi_dataset import collate_fn
 from losses import disc_loss, total_loss
 from model_consistency_0 import EncodecModelWithSliceConsistency
 from msstftd import MultiScaleSTFTDiscriminator
@@ -86,7 +86,6 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
         model_weight_factor: Scaling factor for model losses (loss_g, loss_w). Cosine anneals from 1.0 to 0.5.
         consistency_weight_factor: Scaling factor for consistency losses. Cosine ramps from 0.1 to 1.0.
     """
-    """Train one step function with slice consistency loss."""
     model.train()
     disc_model.train()
     data_length = len(trainloader)
@@ -116,13 +115,9 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
             # Pass batch_idx to enable alternating consistency losses (reduces memory)
             output, loss_w, _, slice_consistency_output = model(input_wav, return_slice_consistency=True, batch_idx=idx)
             
-            # Reshape discriminator input to [B*C, 1, T] for consistency with encoder/decoder
-            B, C, T = input_wav.shape
-            input_wav_reshaped = input_wav.reshape(B * C, 1, T) if C > 1 else input_wav
-            output_reshaped = output.reshape(B * C, 1, T) if C > 1 else output
-            
-            logits_real, fmap_real = disc_model(input_wav_reshaped)
-            logits_fake, fmap_fake = disc_model(output_reshaped)
+            # Multi-dataset uses mono audio, so no reshaping needed
+            logits_real, fmap_real = disc_model(input_wav)
+            logits_fake, fmap_fake = disc_model(output)
             losses_g = total_loss(
                 fmap_real, 
                 logits_fake, 
@@ -270,13 +265,8 @@ def train_one_step(epoch, optimizer, optimizer_disc, model, disc_model, trainloa
 
         if train_discriminator:
             with autocast(enabled=config.common.amp):
-                # Reshape discriminator input to [B*C, 1, T] for consistency with encoder/decoder
-                B, C, T = input_wav.shape
-                input_wav_reshaped = input_wav.reshape(B * C, 1, T) if C > 1 else input_wav
-                output_reshaped = output.reshape(B * C, 1, T) if C > 1 else output
-                
-                logits_real, _ = disc_model(input_wav_reshaped)
-                logits_fake, _ = disc_model(output_reshaped.detach())
+                logits_real, _ = disc_model(input_wav)
+                logits_fake, _ = disc_model(output.detach())
                 loss_disc = disc_loss(logits_real, logits_fake)
                 
                 # Check for NaN in discriminator loss
@@ -442,19 +432,12 @@ def _upload_validation_audio_samples(epoch, model, config, wandb_logger):
             if torch.cuda.is_available():
                 gt_audio = gt_audio.cuda()
             
-            # For multi-channel, take first channel for audio upload
-            B, C, T = gt_audio.shape
-            if C > 1:
-                gt_audio_mono = gt_audio[:, 0:1, :]  # [1, 1, T]
-            else:
-                gt_audio_mono = gt_audio
-            
             # Save ground truth audio (move to CPU first)
             gt_path = temp_dir / f"{demo_folder.name}_gt.wav"
-            save_audio(gt_audio_mono.squeeze(0).cpu(), gt_path, config.model.sample_rate, rescale=True)
+            save_audio(gt_audio.squeeze(0).cpu(), gt_path, config.model.sample_rate, rescale=True)
             
             # Load ground truth for SI-SNR calculation
-            gt_audio_np = gt_audio_mono.squeeze(0).cpu().numpy()
+            gt_audio_np = gt_audio.squeeze(0).cpu().numpy()
             if len(gt_audio_np.shape) > 1:
                 gt_audio_np = gt_audio_np[0] if gt_audio_np.shape[0] < gt_audio_np.shape[-1] else gt_audio_np.flatten()
             
@@ -471,7 +454,7 @@ def _upload_validation_audio_samples(epoch, model, config, wandb_logger):
             for bandwidth in sample_bandwidths:
                 model.bandwidth = bandwidth
                 
-                # Reconstruct (use full multi-channel input)
+                # Reconstruct
                 with torch.no_grad():
                     if hasattr(model, 'use_slice_consistency') and model.use_slice_consistency:
                         # When return_slice_consistency=False, returns (output, loss_w, frames) - 3 values
@@ -479,19 +462,13 @@ def _upload_validation_audio_samples(epoch, model, config, wandb_logger):
                     else:
                         output = model(gt_audio, batch_idx=0)
                 
-                # For multi-channel, take first channel for audio upload
-                if C > 1:
-                    output_mono = output[:, 0:1, :]  # [1, 1, T]
-                else:
-                    output_mono = output
-                
                 # Save reconstructed audio (move to CPU first)
                 recon_path = temp_dir / f"{demo_folder.name}_bw_{bandwidth}.wav"
-                save_audio(output_mono.squeeze(0).cpu(), recon_path, config.model.sample_rate, rescale=True)
+                save_audio(output.squeeze(0).cpu(), recon_path, config.model.sample_rate, rescale=True)
                 
                 # Calculate SI-SNR
                 try:
-                    recon_audio_np = output_mono.squeeze(0).cpu().numpy()
+                    recon_audio_np = output.squeeze(0).cpu().numpy()
                     if len(recon_audio_np.shape) > 1:
                         recon_audio_np = recon_audio_np[0] if recon_audio_np.shape[0] < recon_audio_np.shape[-1] else recon_audio_np.flatten()
                     si_snr_value = calculate_si_snr(gt_audio_np, recon_audio_np)
@@ -563,8 +540,6 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
     
     augmentation_consistency_codebook0 = defaultdict(list)  # Original full vs perturbed full (codebook 0 only)
     
-    inter_channel_consistency_codebook0 = defaultdict(list)  # Between random channels (codebook 0 only)
-    
     for idx, batch_data in enumerate(valloader):
         # Handle new dataset format: (waveforms, sample_rates, selected_channels_list)
         if isinstance(batch_data, tuple) and len(batch_data) == 3:
@@ -588,13 +563,9 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 output = model(input_wav, batch_idx=idx)
                 slice_consistency_output = None
             
-            # Reshape discriminator input to [B*C, 1, T] for consistency with encoder/decoder
-            B, C, T = input_wav.shape
-            input_wav_reshaped = input_wav.reshape(B * C, 1, T) if C > 1 else input_wav
-            output_reshaped = output.reshape(B * C, 1, T) if C > 1 else output
-            
-            logits_real, fmap_real = disc_model(input_wav_reshaped)
-            logits_fake, fmap_fake = disc_model(output_reshaped)
+            # Multi-dataset uses mono audio, so no reshaping needed
+            logits_real, fmap_real = disc_model(input_wav)
+            logits_fake, fmap_fake = disc_model(output)
             loss_disc = disc_loss(logits_real, logits_fake)
             losses_g = total_loss(fmap_real, logits_fake, fmap_fake, input_wav, output)
             
@@ -610,10 +581,6 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 # Augmentation consistency metrics (original full vs perturbed full) - codebook 0 only
                 if 'augmentation_consistency_codebook0_accuracy' in slice_consistency_output:
                     augmentation_consistency_codebook0[bandwidth].append(slice_consistency_output['augmentation_consistency_codebook0_accuracy'])
-                
-                # Inter-channel consistency metrics (between random channels) - codebook 0 only
-                if 'inter_channel_consistency_codebook0_accuracy' in slice_consistency_output:
-                    inter_channel_consistency_codebook0[bandwidth].append(slice_consistency_output['inter_channel_consistency_codebook0_accuracy'])
             
             # Calculate comprehensive metrics for each sample in batch
             batch_size = input_wav.shape[0]
@@ -664,12 +631,6 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                 aug_cb0 = augmentation_consistency_codebook0[bandwidth]
                 avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
                 logger.info(f"    Augmentation Consistency Codebook 0: {avg_aug_cb0:.4f}")
-            
-            # Log inter-channel consistency accuracy metrics (between random channels) - CODEBOOK 0 ONLY
-            if bandwidth in inter_channel_consistency_codebook0 and len(inter_channel_consistency_codebook0[bandwidth]) > 0:
-                inter_cb0 = inter_channel_consistency_codebook0[bandwidth]
-                avg_inter_cb0 = sum(inter_cb0) / len(inter_cb0)
-                logger.info(f"    Inter-Channel Consistency Codebook 0: {avg_inter_cb0:.4f}")
     
     # Weights & Biases logging
     if wandb_logger:
@@ -701,12 +662,6 @@ def validate(epoch, model, disc_model, valloader, config, wandb_logger=None):
                     aug_cb0 = augmentation_consistency_codebook0[bandwidth]
                     avg_aug_cb0 = sum(aug_cb0) / len(aug_cb0)
                     val_log_dict[f'val/augmentation_consistency_codebook0_bw_{bandwidth}'] = avg_aug_cb0
-                
-                # Log inter-channel consistency accuracy metrics (between random channels) - CODEBOOK 0 ONLY
-                if bandwidth in inter_channel_consistency_codebook0 and len(inter_channel_consistency_codebook0[bandwidth]) > 0:
-                    inter_cb0 = inter_channel_consistency_codebook0[bandwidth]
-                    avg_inter_cb0 = sum(inter_cb0) / len(inter_cb0)
-                    val_log_dict[f'val/inter_channel_consistency_codebook0_bw_{bandwidth}'] = avg_inter_cb0
         
         wandb_logger.log(val_log_dict)
         
@@ -728,7 +683,7 @@ def train(config):
     logger.handlers.clear()
 
     # Set up logging
-    file_handler = logging.FileHandler(f"{config.checkpoint.save_folder}/train_consistency_0_bs{config.datasets.batch_size}_lr{config.optimization.lr}.log")
+    file_handler = logging.FileHandler(f"{config.checkpoint.save_folder}/train_multi_dataset_consistency_bs{config.datasets.batch_size}_lr{config.optimization.lr}.log")
     formatter = logging.Formatter('%(asctime)s: %(levelname)s: [%(filename)s: %(lineno)d]: %(message)s')
     file_handler.setFormatter(formatter)
 
@@ -746,8 +701,8 @@ def train(config):
     if config.get('wandb', {}).get('enabled', True):
         try:
             wandb.init(
-                project=config.get('wandb', {}).get('project', 'eigenscape-encodec-consistency-0'),
-                name=config.get('wandb', {}).get('name', f'consistency_0_bs{config.datasets.batch_size}_lr{config.optimization.lr}'),
+                project=config.get('wandb', {}).get('project', 'multi-dataset-encodec-consistency'),
+                name=config.get('wandb', {}).get('name', f'multi_dataset_consistency_bs{config.datasets.batch_size}_lr{config.optimization.lr}'),
                 config=dict(config),
                 dir=config.checkpoint.save_folder,
             )
@@ -762,7 +717,7 @@ def train(config):
         set_seed(config.common.seed)
 
     # Set up datasets
-    trainset = data.EigenscapeDataset(config=config, mode='train')
+    trainset = data.MultiDataset(config=config, mode='train')
     
     # Create data loaders
     trainloader = torch.utils.data.DataLoader(
@@ -780,15 +735,13 @@ def train(config):
     slice_consistency_config = config.model.get('slice_consistency', None)
     # Get perturb encoder config
     perturb_encoder_config = config.model.get('perturb_encoder', None)
-    # Get inter-channel consistency config
-    inter_channel_consistency_config = config.model.get('inter_channel_consistency', None)
+    # No inter-channel consistency for multi-dataset (mono audio)
     
-    # Model processes each channel separately as mono (channels=1)
-    # Reshapes [B, C, T] -> [B*C, 1, T] to process each channel separately
+    # Model processes mono audio (channels=1)
     model = EncodecModelWithSliceConsistency._get_model(
         config.model.target_bandwidths, 
         config.model.sample_rate, 
-        channels=1,
+        channels=config.model.channels,
         causal=config.model.causal, 
         model_norm=config.model.norm, 
         audio_normalize=config.model.audio_normalize,
@@ -797,12 +750,12 @@ def train(config):
         ratios=config.model.ratios,
         slice_consistency=slice_consistency_config,
         perturb_encoder=perturb_encoder_config,
-        inter_channel_consistency=inter_channel_consistency_config,
+        inter_channel_consistency=None,  # Disabled for multi-dataset
     )
     
     disc_model = MultiScaleSTFTDiscriminator(
-        in_channels=1,
-        out_channels=1,
+        in_channels=config.model.channels,
+        out_channels=config.model.channels,
         filters=config.model.filters,
         hop_lengths=config.model.disc_hop_lengths,
         win_lengths=config.model.disc_win_lengths,
@@ -862,7 +815,7 @@ def train(config):
         disc_model.cuda()
 
     logger.info(f"Training: {len(trainloader)} batches (batch_size={config.datasets.batch_size})")
-    logger.info(f"Validation: 2k fixed segments per epoch (batch_size={config.datasets.batch_size})")
+    logger.info(f"Validation: 10k fixed segments per epoch (batch_size={config.datasets.batch_size})")
 
     # Set up optimizers and schedulers
     params = [p for p in model.parameters() if p.requires_grad]
@@ -966,7 +919,7 @@ def train(config):
         if epoch % config.common.val_interval == 0 and epoch > 0:
             # Create validation dataset with fixed segments (same every epoch)
             # Note: dataset is recreated but uses fixed seed, so segments are identical
-            valset = data.EigenscapeDataset(config=config, mode='val')
+            valset = data.MultiDataset(config=config, mode='val')
             valloader = torch.utils.data.DataLoader(
                 valset,
                 batch_size=config.datasets.batch_size,
@@ -998,7 +951,7 @@ def train(config):
             upload_artifacts = config.get('wandb', {}).get('upload_artifacts', True)
             if wandb_logger and upload_artifacts:
                 try:
-                    artifact = wandb.Artifact(f'consistency_0_model_epoch_{epoch}', type='model')
+                    artifact = wandb.Artifact(f'multi_dataset_consistency_model_epoch_{epoch}', type='model')
                     
                     # CRITICAL: Wrap add_file in timeout - file I/O can hang on network filesystems
                     # artifact.add_file() reads files from disk and can block indefinitely
@@ -1050,7 +1003,7 @@ def train(config):
         wandb.finish()
 
 
-@hydra.main(config_path='config', config_name='config_consistency_0')
+@hydra.main(config_path='config', config_name='config_multi_dataset_consistency')
 def main(config):
     # Disable cudnn
     torch.backends.cudnn.enabled = False
@@ -1067,3 +1020,4 @@ def main(config):
 
 if __name__ == '__main__':
     main()
+
